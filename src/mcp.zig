@@ -1,0 +1,495 @@
+// codedb2 MCP server — JSON-RPC 2.0 over stdio
+//
+// Exposes codedb2's exploration + edit engine as MCP tools.
+// Register in your MCP config:
+//   "codedb": { "command": "/path/to/codedb-mcp", "args": ["/path/to/project"] }
+
+const std = @import("std");
+const Store = @import("store.zig").Store;
+const Explorer = @import("explore.zig").Explorer;
+const AgentRegistry = @import("agent.zig").AgentRegistry;
+const watcher = @import("watcher.zig");
+const edit_mod = @import("edit.zig");
+const idx = @import("index.zig");
+
+// ── Tool definitions ────────────────────────────────────────────────────────
+
+const Tool = enum {
+    codedb_tree,
+    codedb_outline,
+    codedb_symbol,
+    codedb_search,
+    codedb_word,
+    codedb_hot,
+    codedb_deps,
+    codedb_read,
+    codedb_edit,
+    codedb_changes,
+    codedb_status,
+};
+
+const tools_list =
+    \\{"tools":[
+    \\{"name":"codedb_tree","description":"Get the full file tree of the indexed codebase with language detection, line counts, and symbol counts per file. Use this first to understand the project structure.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"codedb_outline","description":"Get the structural outline of a file: all functions, structs, enums, imports, constants with line numbers. Like an IDE symbol view.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"}},"required":["path"]}},
+    \\{"name":"codedb_symbol","description":"Find ALL definitions of a symbol name across the entire codebase. Returns every file and line where this symbol is defined.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"}},"required":["name"]}},
+    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Uses trigram index for fast substring matching. Returns matching lines with file paths and line numbers.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50)"}},"required":["query"]}},
+    \\{"name":"codedb_word","description":"O(1) word lookup using inverted index. Finds all occurrences of an exact word (identifier) across the codebase. Much faster than search for single-word queries.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"}},"required":["word"]}},
+    \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"}},"required":[]}},
+    \\{"name":"codedb_deps","description":"Get reverse dependencies: which files import/depend on the given file. Useful for impact analysis.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"}},"required":["path"]}},
+    \\{"name":"codedb_read","description":"Read the full contents of a file from the indexed codebase.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"}},"required":["path"]}},
+    \\{"name":"codedb_edit","description":"Apply a line-based edit to a file. Supports replace (range), insert (after line), and delete (range) operations.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["replace","insert","delete"],"description":"Edit operation type"},"content":{"type":"string","description":"New content (for replace/insert)"},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"}},"required":["path","op"]}},
+    \\{"name":"codedb_changes","description":"Get files that changed since a sequence number. Use with codedb_status to poll for changes.","inputSchema":{"type":"object","properties":{"since":{"type":"integer","description":"Sequence number to get changes since (default: 0)"}},"required":[]}},
+    \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{},"required":[]}}
+    \\]}
+;
+
+// ── MCP Server ──────────────────────────────────────────────────────────────
+
+pub fn run(
+    alloc: std.mem.Allocator,
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+) void {
+    const stdout = std.fs.File.stdout();
+    const stdin = std.fs.File.stdin();
+
+    while (true) {
+        const line = readLine(alloc, stdin) orelse break;
+        defer alloc.free(line);
+
+        const input = std.mem.trim(u8, line, " \t\r");
+        if (input.len == 0) continue;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
+            writeError(alloc, stdout, null, -32700, "Parse error");
+            continue;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            writeError(alloc, stdout, null, -32600, "Invalid Request");
+            continue;
+        }
+
+        const root = &parsed.value.object;
+        const method = getStr(root, "method") orelse {
+            writeError(alloc, stdout, null, -32600, "Missing method");
+            continue;
+        };
+        const id = root.get("id");
+
+        if (eql(method, "initialize")) {
+            writeResult(alloc, stdout, id,
+                \\{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb2","version":"0.1.0"}}
+            );
+        } else if (eql(method, "notifications/initialized")) {
+            // no response for notifications
+        } else if (eql(method, "tools/list")) {
+            writeResult(alloc, stdout, id, tools_list);
+        } else if (eql(method, "tools/call")) {
+            handleCall(alloc, root, stdout, id, store, explorer, agents);
+        } else if (eql(method, "ping")) {
+            writeResult(alloc, stdout, id, "{}");
+        } else {
+            if (id != null) writeError(alloc, stdout, id, -32601, "Method not found");
+        }
+    }
+}
+
+fn handleCall(
+    alloc: std.mem.Allocator,
+    root: *const std.json.ObjectMap,
+    stdout: std.fs.File,
+    id: ?std.json.Value,
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+) void {
+    const params_val = root.get("params") orelse {
+        writeError(alloc, stdout, id, -32602, "Missing params");
+        return;
+    };
+    if (params_val != .object) {
+        writeError(alloc, stdout, id, -32602, "params must be object");
+        return;
+    }
+    const params = &params_val.object;
+
+    const name = getStr(params, "name") orelse {
+        writeError(alloc, stdout, id, -32602, "Missing tool name");
+        return;
+    };
+
+    const args_val = params.get("arguments") orelse {
+        writeError(alloc, stdout, id, -32602, "Missing arguments");
+        return;
+    };
+    if (args_val != .object) {
+        writeError(alloc, stdout, id, -32602, "arguments must be object");
+        return;
+    }
+    const args = &args_val.object;
+
+    const tool = std.meta.stringToEnum(Tool, name) orelse {
+        writeError(alloc, stdout, id, -32602, "Unknown tool");
+        return;
+    };
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(alloc);
+
+    dispatch(alloc, tool, args, &out, store, explorer, agents);
+
+    // Wrap in MCP content envelope
+    var result: std.ArrayList(u8) = .{};
+    defer result.deinit(alloc);
+    result.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
+    writeEscaped(alloc, &result, out.items);
+    result.appendSlice(alloc, "\"}],\"isError\":false}") catch return;
+
+    writeResult(alloc, stdout, id, result.items);
+}
+
+fn dispatch(
+    alloc: std.mem.Allocator,
+    tool: Tool,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+    store: *Store,
+    explorer: *Explorer,
+    agents: *AgentRegistry,
+) void {
+    switch (tool) {
+        .codedb_tree => handleTree(alloc, out, explorer),
+        .codedb_outline => handleOutline(alloc, args, out, explorer),
+        .codedb_symbol => handleSymbol(alloc, args, out, explorer),
+        .codedb_search => handleSearch(alloc, args, out, explorer),
+        .codedb_word => handleWord(alloc, args, out, explorer),
+        .codedb_hot => handleHot(alloc, args, out, store, explorer),
+        .codedb_deps => handleDeps(alloc, args, out, explorer),
+        .codedb_read => handleRead(alloc, args, out),
+        .codedb_edit => handleEdit(alloc, args, out, store, agents),
+        .codedb_changes => handleChanges(alloc, args, out, store),
+        .codedb_status => handleStatus(alloc, out, store, explorer),
+    }
+}
+
+// ── Tool handlers ───────────────────────────────────────────────────────────
+
+fn handleTree(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const tree = explorer.getTree(alloc) catch {
+        out.appendSlice(alloc, "error: failed to get tree") catch {};
+        return;
+    };
+    defer alloc.free(tree);
+    out.appendSlice(alloc, tree) catch {};
+}
+
+fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    const outline = explorer.getOutline(path) orelse {
+        out.appendSlice(alloc, "error: file not indexed: ") catch {};
+        out.appendSlice(alloc, path) catch {};
+        return;
+    };
+    const w = out.writer(alloc);
+    w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
+        outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
+    }) catch {};
+    for (outline.symbols.items) |sym| {
+        w.print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+        if (sym.detail) |d| w.print("  // {s}", .{d}) catch {};
+        w.writeAll("\n") catch {};
+    }
+}
+
+fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const name = getStr(args, "name") orelse {
+        out.appendSlice(alloc, "error: missing 'name' argument") catch {};
+        return;
+    };
+    const results = explorer.findAllSymbols(name, alloc) catch {
+        out.appendSlice(alloc, "error: search failed") catch {};
+        return;
+    };
+    defer alloc.free(results);
+
+    if (results.len == 0) {
+        out.appendSlice(alloc, "no results for: ") catch {};
+        out.appendSlice(alloc, name) catch {};
+        return;
+    }
+
+    const w = out.writer(alloc);
+    w.print("{d} results for '{s}':\n", .{ results.len, name }) catch {};
+    for (results) |r| {
+        w.print("  {s}:{d} ({s})", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) }) catch {};
+        if (r.symbol.detail) |d| w.print("  // {s}", .{d}) catch {};
+        w.writeAll("\n") catch {};
+    }
+}
+
+fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const query = getStr(args, "query") orelse {
+        out.appendSlice(alloc, "error: missing 'query' argument") catch {};
+        return;
+    };
+    const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, n)) else 50;
+
+    const results = explorer.searchContent(query, alloc, max_results) catch {
+        out.appendSlice(alloc, "error: search failed") catch {};
+        return;
+    };
+    defer {
+        for (results) |r| alloc.free(r.line_text);
+        alloc.free(results);
+    }
+
+    const w = out.writer(alloc);
+    w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+    for (results) |r| {
+        w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+    }
+}
+
+fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const word = getStr(args, "word") orelse {
+        out.appendSlice(alloc, "error: missing 'word' argument") catch {};
+        return;
+    };
+    const hits = explorer.searchWord(word, alloc) catch {
+        out.appendSlice(alloc, "error: word search failed") catch {};
+        return;
+    };
+    defer alloc.free(hits);
+
+    const w = out.writer(alloc);
+    w.print("{d} hits for '{s}':\n", .{ hits.len, word }) catch {};
+    for (hits) |h| {
+        w.print("  {s}:{d}\n", .{ h.path, h.line_num }) catch {};
+    }
+}
+
+fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
+    const limit: usize = if (getInt(args, "limit")) |n| @intCast(@max(1, n)) else 10;
+    const hot = explorer.getHotFiles(store, limit) catch {
+        out.appendSlice(alloc, "error: hot files failed") catch {};
+        return;
+    };
+    // hot is arena-allocated, don't free
+
+    const w = out.writer(alloc);
+    for (hot, 0..) |path, i| {
+        w.print("{d}. {s}\n", .{ i + 1, path }) catch {};
+    }
+}
+
+fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    const imported_by = explorer.getImportedBy(path) catch {
+        out.appendSlice(alloc, "error: deps failed") catch {};
+        return;
+    };
+    // arena-allocated, don't free
+
+    const w = out.writer(alloc);
+    w.print("{s} is imported by:\n", .{path}) catch {};
+    if (imported_by.len == 0) {
+        w.writeAll("  (no dependents found)\n") catch {};
+    } else {
+        for (imported_by) |dep| {
+            w.print("  {s}\n", .{dep}) catch {};
+        }
+    }
+}
+
+fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        out.appendSlice(alloc, "error: file not found: ") catch {};
+        out.appendSlice(alloc, path) catch {};
+        return;
+    };
+    defer file.close();
+    const content = file.readToEndAlloc(alloc, 10 * 1024 * 1024) catch {
+        out.appendSlice(alloc, "error: failed to read file") catch {};
+        return;
+    };
+    defer alloc.free(content);
+    out.appendSlice(alloc, content) catch {};
+}
+
+fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, agents: *AgentRegistry) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path'") catch {};
+        return;
+    };
+    const op_str = getStr(args, "op") orelse "replace";
+    const op: @import("version.zig").Op = if (eql(op_str, "insert"))
+        .insert
+    else if (eql(op_str, "delete"))
+        .delete
+    else
+        .replace;
+
+    const content = getStr(args, "content");
+    const range_start = getInt(args, "range_start");
+    const range_end = getInt(args, "range_end");
+    const after = getInt(args, "after");
+
+    // Use agent 1 (the __filesystem__ agent registered at startup)
+    var req = edit_mod.EditRequest{
+        .path = path,
+        .agent_id = 1,
+        .op = op,
+        .content = content,
+    };
+    if (range_start != null and range_end != null) {
+        req.range = .{ @intCast(range_start.?), @intCast(range_end.?) };
+    }
+    if (after) |a| req.after = @intCast(a);
+
+    const result = edit_mod.applyEdit(alloc, store, agents, req) catch |err| {
+        out.appendSlice(alloc, "error: edit failed: ") catch {};
+        out.appendSlice(alloc, @errorName(err)) catch {};
+        return;
+    };
+
+    const w = out.writer(alloc);
+    w.print("edit applied: seq={d}, size={d}, hash={d}", .{ result.seq, result.new_size, result.new_hash }) catch {};
+}
+
+fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {
+    const since: u64 = if (getInt(args, "since")) |n| @intCast(@max(0, n)) else 0;
+    const changes = store.changesSinceDetailed(since, alloc) catch {
+        out.appendSlice(alloc, "error: changes query failed") catch {};
+        return;
+    };
+    defer alloc.free(changes);
+
+    const w = out.writer(alloc);
+    w.print("seq: {d}, {d} files changed since {d}:\n", .{ store.currentSeq(), changes.len, since }) catch {};
+    for (changes) |c| {
+        w.print("  {s} (seq={d}, op={s}, size={d})\n", .{ c.path, c.seq, @tagName(c.op), c.size }) catch {};
+    }
+}
+
+fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
+    _ = explorer;
+    const w = out.writer(alloc);
+    w.print("codedb2 status:\n  seq: {d}\n  files: {d}\n", .{
+        store.currentSeq(),
+        store.currentSeq(), // approximate — each initial scan file = 1 seq
+    }) catch {};
+}
+
+// ── JSON-RPC helpers (same pattern as mcp-zig) ──────────────────────────────
+
+fn readLine(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
+    var line: std.ArrayList(u8) = .{};
+    var buf: [1]u8 = undefined;
+    while (true) {
+        const n = file.read(&buf) catch { line.deinit(alloc); return null; };
+        if (n == 0) {
+            if (line.items.len == 0) { line.deinit(alloc); return null; }
+            return line.toOwnedSlice(alloc) catch null;
+        }
+        if (buf[0] == '\n') return line.toOwnedSlice(alloc) catch null;
+        line.append(alloc, buf[0]) catch { line.deinit(alloc); return null; };
+        if (line.items.len > 1024 * 1024) { line.deinit(alloc); return null; }
+    }
+}
+
+fn getStr(obj: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return switch (obj.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn getInt(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
+    return switch (obj.get(key) orelse return null) {
+        .integer => |n| n,
+        else => null,
+    };
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn writeResult(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, result: []const u8) void {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(alloc);
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    appendId(alloc, &buf, id);
+    buf.appendSlice(alloc, ",\"result\":") catch return;
+    for (result) |c| {
+        if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
+    }
+    buf.appendSlice(alloc, "}\n") catch return;
+    _ = stdout.write(buf.items) catch 0;
+}
+
+fn writeError(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(alloc);
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    appendId(alloc, &buf, id);
+    buf.appendSlice(alloc, ",\"error\":{\"code\":") catch return;
+    var tmp: [12]u8 = undefined;
+    const cs = std.fmt.bufPrint(&tmp, "{d}", .{code}) catch return;
+    buf.appendSlice(alloc, cs) catch return;
+    buf.appendSlice(alloc, ",\"message\":\"") catch return;
+    writeEscaped(alloc, &buf, msg);
+    buf.appendSlice(alloc, "\"}}\n") catch return;
+    _ = stdout.write(buf.items) catch 0;
+}
+
+fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
+    if (id) |v| switch (v) {
+        .integer => |n| {
+            var tmp: [20]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return;
+            buf.appendSlice(alloc, s) catch return;
+        },
+        .string => |s| {
+            buf.append(alloc, '"') catch return;
+            writeEscaped(alloc, buf, s);
+            buf.append(alloc, '"') catch return;
+        },
+        else => buf.appendSlice(alloc, "null") catch return,
+    } else {
+        buf.appendSlice(alloc, "null") catch return;
+    }
+}
+
+fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => out.appendSlice(alloc, "\\\"") catch return,
+            '\\' => out.appendSlice(alloc, "\\\\") catch return,
+            '\n' => out.appendSlice(alloc, "\\n") catch return,
+            '\r' => out.appendSlice(alloc, "\\r") catch return,
+            '\t' => out.appendSlice(alloc, "\\t") catch return,
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                out.appendSlice(alloc, &esc) catch return;
+            } else {
+                out.append(alloc, c) catch return;
+            },
+        }
+    }
+}

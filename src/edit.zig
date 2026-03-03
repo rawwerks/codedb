@@ -1,0 +1,88 @@
+const std = @import("std");
+const Store = @import("store.zig").Store;
+const AgentRegistry = @import("agent.zig").AgentRegistry;
+const AgentId = @import("agent.zig").AgentId;
+const Op = @import("version.zig").Op;
+
+pub const EditRequest = struct {
+    path: []const u8,
+    agent_id: AgentId,
+    op: Op,
+    range: ?[2]usize = null,
+    after: ?usize = null,
+    content: ?[]const u8 = null,
+};
+
+pub const EditResult = struct {
+    seq: u64,
+    new_hash: u64,
+    new_size: u64,
+};
+
+pub fn applyEdit(
+    allocator: std.mem.Allocator,
+    store: *Store,
+    agents: *AgentRegistry,
+    req: EditRequest,
+) !EditResult {
+    const has_lock = try agents.tryLock(req.agent_id, req.path, 30_000);
+    if (!has_lock) return error.FileLocked;
+
+    const file = try std.fs.cwd().openFile(req.path, .{});
+    defer file.close();
+    const source = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    defer allocator.free(source);
+
+    var lines: std.ArrayList([]const u8) = .{};
+    defer lines.deinit(allocator);
+    var iter = std.mem.splitScalar(u8, source, '\n');
+    while (iter.next()) |line| try lines.append(allocator, line);
+
+    switch (req.op) {
+        .replace => {
+            if (req.range) |range| {
+                const start = range[0] -| 1;
+                const end = @min(range[1], lines.items.len);
+                const new_content = req.content orelse return error.MissingContent;
+                var new_lines: std.ArrayList([]const u8) = .{};
+                defer new_lines.deinit(allocator);
+                var ni = std.mem.splitScalar(u8, new_content, '\n');
+                while (ni.next()) |nl| try new_lines.append(allocator, nl);
+                try lines.replaceRange(allocator, start, end - start, new_lines.items);
+            }
+        },
+        .insert => {
+            if (req.after) |after_line| {
+                const pos = @min(after_line, lines.items.len);
+                const content = req.content orelse return error.MissingContent;
+                try lines.insert(allocator, pos, content);
+            }
+        },
+        .delete => {
+            if (req.range) |range| {
+                const start = range[0] -| 1;
+                const end = @min(range[1], lines.items.len);
+                // Remove lines [start..end) by replacing with nothing
+                try lines.replaceRange(allocator, start, end - start, &.{});
+            }
+        },
+        else => {},
+    }
+
+    const result = try std.mem.join(allocator, "\n", lines.items);
+    defer allocator.free(result);
+    const out = try std.fs.cwd().createFile(req.path, .{});
+    defer out.close();
+    try out.writeAll(result);
+
+    const hash: u64 = std.hash.Wyhash.hash(0, result);
+    const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, result.len, req.content);
+
+    agents.releaseLock(req.agent_id, req.path);
+
+    return .{
+        .seq = seq,
+        .new_hash = hash,
+        .new_size = result.len,
+    };
+}
