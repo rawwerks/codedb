@@ -59,7 +59,9 @@ pub fn main() !void {
 
     var explorer = Explorer.init(allocator);
     defer explorer.deinit();
-    try watcher.initialScan(&store, &explorer, root, allocator);
+    if (!std.mem.eql(u8, cmd, "mcp")) {
+        try watcher.initialScan(&store, &explorer, root, allocator);
+    }
 
     if (std.mem.eql(u8, cmd, "tree")) {
         const tree = try explorer.getTree(allocator);
@@ -173,13 +175,16 @@ pub fn main() !void {
         var shutdown = std.atomic.Value(bool).init(false);
 
         var queue = watcher.EventQueue{};
+        const scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator });
+        scan_thread.detach();
+
         const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown });
         defer watch_thread.join();
 
         const isr_thread = try std.Thread.spawn(.{}, Prerender.isrLoop, .{ &prerender, &explorer, &store, &shutdown });
         defer isr_thread.join();
 
-        std.log.info("codedb2 mcp: root={s} files={d} data={s}", .{ abs_root, store.currentSeq(), data_dir });
+        std.log.info("codedb2 mcp: root={s} data={s}", .{ abs_root, data_dir });
         defer shutdown.store(true, .release);
         mcp_server.run(allocator, &store, &explorer, &agents, &prerender);
     } else {
@@ -250,4 +255,10 @@ fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
         std.Thread.sleep(5 * std.time.ns_per_s);
         agents.reapStale(30_000);
     }
+}
+
+fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator) void {
+    watcher.initialScan(store, explorer, root, allocator) catch |err| {
+        std.log.warn("background scan failed: {}", .{err});
+    };
 }
