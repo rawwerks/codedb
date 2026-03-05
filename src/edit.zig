@@ -104,6 +104,9 @@ pub fn applyEdit(
     };
 
     const hash: u64 = std.hash.Wyhash.hash(0, result);
+    // KNOWN LIMITATION: if recordEdit fails here, the file is already on disk but not
+    // in the store. This leaves the disk and store inconsistent. Recovery would require
+    // re-reading the file and re-recording, or a crash-recovery scan at startup.
     const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, result.len, req.content);
 
     agents.releaseLock(req.agent_id, req.path);

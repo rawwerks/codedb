@@ -83,8 +83,9 @@ pub fn run(
             writeError(alloc, stdout, null, -32600, "Missing method");
             continue;
         };
+        const has_id = root.contains("id");
         const id = root.get("id");
-        const is_notification = id == null;
+        const is_notification = !has_id;
 
         if (eql(method, "initialize")) {
             if (!is_notification) {
@@ -132,10 +133,9 @@ fn handleCall(
         if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing tool name");
         return;
     };
-    var empty_args = std.json.ObjectMap.init(alloc);
-    defer empty_args.deinit();
-
-    var args_value = params.get("arguments") orelse std.json.Value{ .object = empty_args };
+    // Use a fresh empty ObjectMap (not a shallow copy) to avoid use-after-free
+    // if the defer-deinit'd local were to be copied into args_value.
+    var args_value = params.get("arguments") orelse std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
     if (args_value != .object) {
         if (!is_notification) writeError(alloc, stdout, id, -32602, "arguments must be object");
         return;
@@ -259,7 +259,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.appendSlice(alloc, "error: missing 'query' argument") catch {};
         return;
     };
-    const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, n)) else 50;
+    const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 50;
 
     const results = explorer.searchContent(query, alloc, max_results) catch {
         out.appendSlice(alloc, "error: search failed") catch {};
@@ -385,15 +385,22 @@ fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         .insert
     else if (eql(op_str, "delete"))
         .delete
-    else
-        .replace;
+    else if (eql(op_str, "replace"))
+        .replace
+    else {
+        out.appendSlice(alloc, "error: unknown op, must be 'replace', 'insert', or 'delete'") catch {};
+        return;
+    };
 
     const content = getStr(args, "content");
     const range_start = getInt(args, "range_start");
     const range_end = getInt(args, "range_end");
     const after = getInt(args, "after");
 
-    // Use agent 1 (the __filesystem__ agent registered at startup)
+    // Use agent 1 (the __filesystem__ agent registered at startup).
+    // TODO: agent_id is hardcoded to 1 — two MCP clients share the same agent_id and
+    // could both acquire locks on different files without conflict, but cannot detect
+    // concurrent edits to the same file from separate connections.
     var req = edit_mod.EditRequest{
         .path = path,
         .agent_id = 1,
@@ -485,10 +492,14 @@ fn readFramedMessage(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
             // EOF mid-line: treat as complete message
             break;
         }
-        if (one[0] == '\n') break;
-        if (one[0] == '\r') continue; // skip CR
-        buf.append(alloc, one[0]) catch return null;
-        if (buf.items.len > 16 * 1024 * 1024) return alloc.dupe(u8, "") catch null;
+        if (buf.items.len > 16 * 1024 * 1024) {
+            // Drain rest of line to prevent framing desync on next call.
+            while (true) {
+                const nr = file.read(&one) catch break;
+                if (nr == 0 or one[0] == '\n') break;
+            }
+            return null;
+        }
     }
 
     return alloc.dupe(u8, buf.items) catch null;

@@ -344,10 +344,15 @@ fn handleConnection(
 
     // ── Explore: outline ──
     if (mem_starts(request, "GET /explore/outline")) {
-        const path = extractQueryParam(request, "path") orelse {
+        const path_raw = extractQueryParam(request, "path") orelse {
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing ?path=\"}");
             return;
         };
+        const path = percentDecode(allocator, path_raw) catch {
+            respondJson(conn, "500 Internal Server Error", "{\"error\":\"decode failed\"}");
+            return;
+        };
+        defer allocator.free(path);
         if (!isPathSafe(path)) {
             respondJson(conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
             return;
@@ -451,10 +456,15 @@ fn handleConnection(
 
     // ── Explore: deps ──
     if (mem_starts(request, "GET /explore/deps")) {
-        const path = extractQueryParam(request, "path") orelse {
+        const path_raw = extractQueryParam(request, "path") orelse {
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing ?path=\"}");
             return;
         };
+        const path = percentDecode(allocator, path_raw) catch {
+            respondJson(conn, "500 Internal Server Error", "{\"error\":\"decode failed\"}");
+            return;
+        };
+        defer allocator.free(path);
         const imported_by = explorer.getImportedBy(path, allocator) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"deps failed\"}");
             return;

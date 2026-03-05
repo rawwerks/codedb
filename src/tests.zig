@@ -587,12 +587,12 @@ test "watcher: queue overflow is explicit" {
     while (true) : (pushed += 1) {
         var path_buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "tmp/f-{d}.zig", .{pushed});
-        if (!queue.push(watcher.FsEvent.init(path, .modified, @intCast(pushed)))) break;
+        if (!queue.push(watcher.FsEvent.init(path, .modified, @intCast(pushed)) orelse unreachable)) break;
     }
 
     var overflow_path_buf: [32]u8 = undefined;
     const overflow_path = try std.fmt.bufPrint(&overflow_path_buf, "tmp/overflow.zig", .{});
-    try testing.expect(!queue.push(watcher.FsEvent.init(overflow_path, .created, 999)));
+    try testing.expect(!queue.push(watcher.FsEvent.init(overflow_path, .created, 999) orelse unreachable));
 
     var popped: usize = 0;
     while (queue.pop() != null) : (popped += 1) {}
@@ -602,7 +602,7 @@ test "watcher: queue overflow is explicit" {
 test "watcher: queue event copies path bytes" {
     var queue = watcher.EventQueue{};
     const original = try testing.allocator.dupe(u8, "tmp/deleted.zig");
-    try testing.expect(queue.push(watcher.FsEvent.init(original, .deleted, 99)));
+    try testing.expect(queue.push(watcher.FsEvent.init(original, .deleted, 99) orelse unreachable));
     testing.allocator.free(original);
 
     const event = queue.pop() orelse return error.TestUnexpectedResult;
@@ -916,13 +916,13 @@ test "regression: queue push stays non-blocking when full" {
     while (true) : (pushed += 1) {
         var path_buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "tmp/fill-{d}.zig", .{pushed});
-        if (!queue.push(watcher.FsEvent.init(path, .modified, @intCast(pushed)))) break;
+        if (!queue.push(watcher.FsEvent.init(path, .modified, @intCast(pushed)) orelse unreachable)) break;
     }
 
     var overflow_path_buf: [32]u8 = undefined;
     const overflow_path = try std.fmt.bufPrint(&overflow_path_buf, "tmp/overflow-2.zig", .{});
     const start = std.time.nanoTimestamp();
-    _ = queue.push(watcher.FsEvent.init(overflow_path, .created, 1000));
+    _ = queue.push(watcher.FsEvent.init(overflow_path, .created, 1000) orelse unreachable);
     const elapsed = std.time.nanoTimestamp() - start;
 
     try testing.expect(elapsed < 50 * std.time.ns_per_ms);

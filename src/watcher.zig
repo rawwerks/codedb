@@ -15,8 +15,9 @@ pub const FsEvent = struct {
     kind: EventKind,
     seq: u64,
 
-    pub fn init(src_path: []const u8, kind: EventKind, seq: u64) FsEvent {
-        std.debug.assert(src_path.len <= std.fs.max_path_bytes);
+    pub fn init(src_path: []const u8, kind: EventKind, seq: u64) ?FsEvent {
+        // Gracefully skip paths exceeding the max instead of panicking.
+        if (src_path.len > std.fs.max_path_bytes) return null;
         var event = FsEvent{
             .path_len = src_path.len,
             .kind = kind,
@@ -305,15 +306,18 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
 }
 
 fn hashFile(dir: std.fs.Dir, path: []const u8, size: u64) !u64 {
+    // Returns 0 for intentional skip (large files, filtered extensions).
+    // Returns maxInt(u64) on IO error so the value always differs from a valid
+    // previously stored hash of 0, preventing a false "content unchanged" conclusion.
     if (shouldSkipFile(path)) return 0;
-    const file = dir.openFile(path, .{}) catch return 0;
+    const file = dir.openFile(path, .{}) catch return std.math.maxInt(u64);
     defer file.close();
     if (size > 512 * 1024) return 0;
 
     var hasher = std.hash.Wyhash.init(0);
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = file.read(&buf) catch return 0;
+        const n = file.read(&buf) catch return std.math.maxInt(u64);
         if (n == 0) break;
         hasher.update(buf[0..n]);
     }
@@ -368,7 +372,7 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
             old.size = stat.size;
             old.hash = hash;
             const stable_path = known_entry.key_ptr.*;
-            pushEventOrWait(queue, FsEvent.init(stable_path, .modified, seq));
+            if (FsEvent.init(stable_path, .modified, seq)) |ev| pushEventOrWait(queue, ev);
             indexFileContent(explorer, dir, stable_path, tmp) catch {};
             prerender.invalidate();
         } else {
@@ -377,7 +381,7 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
             errdefer persistent.free(duped);
             const seq = try store.recordSnapshot(duped, stat.size, 0);
             try known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = true });
-            pushEventOrWait(queue, FsEvent.init(duped, .created, seq));
+            if (FsEvent.init(duped, .created, seq)) |ev| pushEventOrWait(queue, ev);
             indexFileContent(explorer, dir, duped, tmp) catch {};
             prerender.invalidate();
         }
@@ -397,7 +401,7 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
         const seq = store.recordDelete(path, 0) catch continue;
         explorer.removeFile(path);
         if (known.fetchRemove(path)) |kv| {
-            pushEventOrWait(queue, FsEvent.init(kv.key, .deleted, seq));
+            if (FsEvent.init(kv.key, .deleted, seq)) |ev| pushEventOrWait(queue, ev);
             persistent.free(kv.key);
         }
         prerender.invalidate();

@@ -274,12 +274,11 @@ pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocato
 
 fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
     const copied_path = try allocator.dupe(u8, src.path);
-    errdefer allocator.free(copied_path);
+    // No errdefer here: dst.deinit() below handles freeing copied_path via owns_path.
 
     var dst = FileOutline.init(allocator, copied_path);
     dst.owns_path = true;
     errdefer dst.deinit();
-    dst.language = src.language;
     dst.line_count = src.line_count;
     dst.byte_size = src.byte_size;
     for (src.symbols.items) |sym| {
@@ -532,9 +531,9 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         } else if (startsWith(line, "pub const ") or startsWith(line, "const ")) {
             const start: usize = if (startsWith(line, "pub const ")) 10 else 6;
             if (extractIdent(line[start..])) |name| {
-                const kind: SymbolKind = if (std.mem.indexOf(u8, line, "struct") != null)
+                const kind: SymbolKind = if (std.mem.indexOf(u8, line, "struct {") != null)
                     .struct_def
-                else if (std.mem.indexOf(u8, line, "enum") != null)
+                else if (std.mem.indexOf(u8, line, "enum {") != null)
                     .enum_def
                 else if (std.mem.indexOf(u8, line, "union") != null)
                     .union_def

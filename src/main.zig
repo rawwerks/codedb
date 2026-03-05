@@ -36,6 +36,7 @@ pub fn main() !void {
     } else if (args.len >= 3) {
         root = args[1];
         cmd = args[2];
+        cmd_args_start = 3;
     } else {
         printUsage();
         std.process.exit(1);
