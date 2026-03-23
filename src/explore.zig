@@ -455,6 +455,51 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) !
         return result_list.toOwnedSlice(allocator);
     }
 
+    /// Search file contents using a regex pattern with trigram acceleration.
+    /// Decomposes the regex to extract literal trigrams for candidate filtering,
+    /// then does actual regex matching on candidates.
+    pub fn searchContentRegex(self: *Explorer, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        var result_list: std.ArrayList(SearchResult) = .{};
+        errdefer result_list.deinit(allocator);
+
+        // Decompose regex into trigram query
+        var query = idx.decomposeRegex(pattern, self.allocator) catch {
+            // If decomposition fails, fall back to brute force
+            var iter = self.contents.iterator();
+            while (iter.next()) |entry| {
+                try searchInContentRegex(entry.key_ptr.*, entry.value_ptr.*, pattern, allocator, max_results, &result_list);
+                if (result_list.items.len >= max_results) break;
+            }
+            return result_list.toOwnedSlice(allocator);
+        };
+        defer query.deinit();
+
+        const candidate_paths = self.trigram_index.candidatesRegex(&query);
+        defer if (candidate_paths) |cp| self.allocator.free(cp);
+        const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
+
+        if (use_trigram) {
+            for (candidate_paths.?) |path| {
+                const content = self.contents.get(path) orelse continue;
+                try searchInContentRegex(path, content, pattern, allocator, max_results, &result_list);
+                if (result_list.items.len >= max_results) break;
+            }
+        } else {
+            // Brute force — no useful trigrams extracted
+            var iter = self.contents.iterator();
+            while (iter.next()) |entry| {
+                try searchInContentRegex(entry.key_ptr.*, entry.value_ptr.*, pattern, allocator, max_results, &result_list);
+                if (result_list.items.len >= max_results) break;
+            }
+        }
+
+        return result_list.toOwnedSlice(allocator);
+    }
+
+
     /// Search for a word using the inverted word index. O(1) lookup.
     pub fn searchWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
         self.mu.lockShared();
@@ -1080,6 +1125,192 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         }
     }
 }
+
+fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
+    var line_num: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        line_num += 1;
+        if (regexMatch(line, pattern)) {
+            const line_text = try allocator.dupe(u8, line);
+            errdefer allocator.free(line_text);
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+            try result_list.append(allocator, .{
+                .path = path_copy,
+                .line_num = line_num,
+                .line_text = line_text,
+            });
+            if (result_list.items.len >= max_results) return;
+        }
+    }
+}
+
+/// Simple regex matcher — supports: . \s \w \d \S \W \D [chars] [^chars]
+/// * + ? ^ $ | () and escaped literals.
+/// Uses backtracking. Searches for a match anywhere in the string (unanchored).
+pub fn regexMatch(haystack: []const u8, pattern: []const u8) bool {
+    // Handle top-level alternation first: split on unescaped | outside brackets
+    var depth: usize = 0;
+    var in_bracket = false;
+    var i: usize = 0;
+    while (i < pattern.len) {
+        const c = pattern[i];
+        if (c == '\\' and i + 1 < pattern.len) { i += 2; continue; }
+        if (c == '[') { in_bracket = true; i += 1; continue; }
+        if (c == ']') { in_bracket = false; i += 1; continue; }
+        if (in_bracket) { i += 1; continue; }
+        if (c == '(') { depth += 1; i += 1; continue; }
+        if (c == ')') { if (depth > 0) depth -= 1; i += 1; continue; }
+        if (c == '|' and depth == 0) {
+            // Try left branch, then right branch
+            if (regexMatch(haystack, pattern[0..i])) return true;
+            return regexMatch(haystack, pattern[i + 1 ..]);
+        }
+        i += 1;
+    }
+
+    // No top-level alternation
+    if (pattern.len > 0 and pattern[0] == '^') {
+        return matchHere(haystack, pattern[1..], 0);
+    }
+    // Try match at every position (unanchored search)
+    for (0..haystack.len + 1) |start| {
+        if (matchHere(haystack, pattern, start)) return true;
+    }
+    return false;
+}
+
+fn matchHere(haystack: []const u8, pattern: []const u8, pos: usize) bool {
+    var p: usize = 0;
+    var h: usize = pos;
+
+    while (p < pattern.len) {
+        // End anchor
+        if (pattern[p] == '$' and p + 1 == pattern.len) {
+            return h == haystack.len;
+        }
+
+        // Alternation handled at top level in regexMatch
+        if (pattern[p] == '|') return false;
+
+        // Grouping with parens — simplified: just skip parens
+        if (pattern[p] == '(' or pattern[p] == ')') {
+            p += 1;
+            continue;
+        }
+
+        // Check for quantifier following current element
+        const elem_end = elementEnd(pattern, p);
+        if (elem_end < pattern.len) {
+            const qc = pattern[elem_end];
+            if (qc == '*') {
+                return matchQuantified(haystack, pattern, p, elem_end, elem_end + 1, 0, h);
+            }
+            if (qc == '+') {
+                return matchQuantified(haystack, pattern, p, elem_end, elem_end + 1, 1, h);
+            }
+            if (qc == '?') {
+                // Try with one match
+                if (h < haystack.len and matchElement(haystack[h], pattern, p, elem_end)) {
+                    if (matchHere(haystack, pattern[elem_end + 1 ..], h + 1)) return true;
+                }
+                // Try without
+                return matchHere(haystack, pattern[elem_end + 1 ..], h);
+            }
+        }
+
+        // No quantifier — must match exactly one char
+        if (h >= haystack.len) return false;
+        if (!matchElement(haystack[h], pattern, p, elem_end)) return false;
+        h += 1;
+        p = elem_end;
+    }
+
+    return true; // pattern exhausted — match
+}
+
+/// Match a quantified element (greedy).
+fn matchQuantified(haystack: []const u8, pattern: []const u8, elem_start: usize, elem_end: usize, rest_start: usize, min_count: usize, start_pos: usize) bool {
+    // Count max matches
+    var count: usize = 0;
+    var h = start_pos;
+    while (h < haystack.len and matchElement(haystack[h], pattern, elem_start, elem_end)) {
+        count += 1;
+        h += 1;
+    }
+    // Greedy: try from max matches down to min
+    var c: usize = count + 1;
+    while (c > min_count) {
+        c -= 1;
+        if (matchHere(haystack, pattern[rest_start..], start_pos + c)) return true;
+    }
+    return false;
+}
+
+/// Return the index past the current element in the pattern.
+fn elementEnd(pattern: []const u8, p: usize) usize {
+    if (p >= pattern.len) return p;
+    if (pattern[p] == '\\' and p + 1 < pattern.len) return p + 2;
+    if (pattern[p] == '[') {
+        var i = p + 1;
+        if (i < pattern.len and pattern[i] == '^') i += 1;
+        if (i < pattern.len and pattern[i] == ']') i += 1;
+        while (i < pattern.len and pattern[i] != ']') : (i += 1) {}
+        if (i < pattern.len) i += 1;
+        return i;
+    }
+    if (pattern[p] == '.') return p + 1;
+    return p + 1;
+}
+
+/// Match a single character against a pattern element.
+fn matchElement(c: u8, pattern: []const u8, start: usize, end: usize) bool {
+    if (start >= end) return false;
+
+    // Dot matches any char
+    if (pattern[start] == '.' and end == start + 1) return true;
+
+    // Escape sequences
+    if (pattern[start] == '\\' and end == start + 2) {
+        return switch (pattern[start + 1]) {
+            'd' => std.ascii.isDigit(c),
+            'D' => !std.ascii.isDigit(c),
+            'w' => std.ascii.isAlphanumeric(c) or c == '_',
+            'W' => !(std.ascii.isAlphanumeric(c) or c == '_'),
+            's' => c == ' ' or c == '\t' or c == '\n' or c == '\r',
+            'S' => !(c == ' ' or c == '\t' or c == '\n' or c == '\r'),
+            'b', 'B' => false, // word boundary — not a char match
+            else => c == pattern[start + 1],
+        };
+    }
+
+    // Character class [...]
+    if (pattern[start] == '[') {
+        var i = start + 1;
+        var negate = false;
+        if (i < end and pattern[i] == '^') {
+            negate = true;
+            i += 1;
+        }
+        var matched = false;
+        while (i < end and pattern[i] != ']') {
+            if (i + 2 < end and pattern[i + 1] == '-') {
+                // Range
+                if (c >= pattern[i] and c <= pattern[i + 2]) matched = true;
+                i += 3;
+            } else {
+                if (c == pattern[i]) matched = true;
+                i += 1;
+            }
+        }
+        return if (negate) !matched else matched;
+    }
+
+    // Literal
+    return c == pattern[start];
+}
+
 
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;

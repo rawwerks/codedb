@@ -176,14 +176,24 @@ pub fn main() !void {
         }
 
     } else if (std.mem.eql(u8, cmd, "search")) {
-        const query = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search {s}<query>{s}\n", .{
+        // Check for --regex flag
+        var use_regex = false;
+        var query_arg_start = cmd_args_start;
+        if (args.len > cmd_args_start and std.mem.eql(u8, args[cmd_args_start], "--regex")) {
+            use_regex = true;
+            query_arg_start = cmd_args_start + 1;
+        }
+        const query = if (args.len > query_arg_start) args[query_arg_start] else {
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] {s}<query>{s}\n", .{
                 s.red, s.reset, s.cyan, s.reset,
             });
             std.process.exit(1);
         };
         const t0 = std.time.nanoTimestamp();
-        const results = try explorer.searchContent(query, allocator, 50);
+        const results = if (use_regex)
+            try explorer.searchContentRegex(query, allocator, 50)
+        else
+            try explorer.searchContent(query, allocator, 50);
         defer {
             for (results) |r| allocator.free(r.line_text);
             allocator.free(results);
@@ -195,10 +205,11 @@ pub fn main() !void {
                 s.yellow, s.reset, s.bold, query, s.reset,
             });
         } else {
-            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}  {s}{s}{s}\n", .{
+            const mode_label: []const u8 = if (use_regex) " (regex)" else "";
+            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}{s}  {s}{s}{s}\n", .{
                 s.green, s.reset,
                 s.bold, results.len, s.reset,
-                s.bold, query, s.reset,
+                s.bold, query, s.reset, mode_label,
                 sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
             });
             for (results) |r| {

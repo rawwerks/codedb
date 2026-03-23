@@ -1602,3 +1602,231 @@ test "extractLines: compact on all-comment file returns empty" {
     defer testing.allocator.free(result);
     try testing.expect(result.len == 0);
 }
+// ── Regex decomposition tests ───────────────────────────────
+
+const decomposeRegex = @import("index.zig").decomposeRegex;
+const RegexQuery = @import("index.zig").RegexQuery;
+const packTrigram = @import("index.zig").packTrigram;
+const regexMatch = explore.regexMatch;
+
+test "decomposeRegex: pure literal extracts trigrams" {
+    var q = try decomposeRegex("hello", testing.allocator);
+    defer q.deinit();
+    // "hello" has 3 trigrams: hel, ell, llo
+    try testing.expectEqual(@as(usize, 3), q.and_trigrams.len);
+    try testing.expectEqual(@as(usize, 0), q.or_groups.len);
+}
+
+test "decomposeRegex: short literal yields no trigrams" {
+    var q = try decomposeRegex("ab", testing.allocator);
+    defer q.deinit();
+    try testing.expectEqual(@as(usize, 0), q.and_trigrams.len);
+}
+
+test "decomposeRegex: dot breaks trigram chain" {
+    var q = try decomposeRegex("he.lo", testing.allocator);
+    defer q.deinit();
+    // "he" then "lo" — neither long enough for trigrams
+    try testing.expectEqual(@as(usize, 0), q.and_trigrams.len);
+}
+
+test "decomposeRegex: dot in longer literal" {
+    var q = try decomposeRegex("hello.world", testing.allocator);
+    defer q.deinit();
+    // "hello" -> hel,ell,llo; "world" -> wor,orl,rld = 6 trigrams
+    try testing.expectEqual(@as(usize, 6), q.and_trigrams.len);
+}
+
+test "decomposeRegex: alternation creates OR groups" {
+    var q = try decomposeRegex("foo|bar", testing.allocator);
+    defer q.deinit();
+    try testing.expectEqual(@as(usize, 0), q.and_trigrams.len);
+    // All branch trigrams merged into single OR group
+    try testing.expectEqual(@as(usize, 1), q.or_groups.len);
+    // "foo" has 1 trigram + "bar" has 1 trigram = 2 trigrams in the group
+    try testing.expectEqual(@as(usize, 2), q.or_groups[0].len);
+}
+
+test "decomposeRegex: quantifier removes preceding char" {
+    var q = try decomposeRegex("hel+o", testing.allocator);
+    defer q.deinit();
+    // "he" then "o" — + removes 'l', neither segment >= 3
+    try testing.expectEqual(@as(usize, 0), q.and_trigrams.len);
+}
+
+test "decomposeRegex: escaped literal preserved" {
+    var q = try decomposeRegex("a\\.bc", testing.allocator);
+    defer q.deinit();
+    // Escaped dot is literal: "a.bc" = 2 trigrams: a.b, .bc
+    try testing.expectEqual(@as(usize, 2), q.and_trigrams.len);
+}
+
+test "decomposeRegex: character class breaks chain" {
+    var q = try decomposeRegex("abc[xy]def", testing.allocator);
+    defer q.deinit();
+    // "abc" = 1 trigram, "def" = 1 trigram
+    try testing.expectEqual(@as(usize, 2), q.and_trigrams.len);
+}
+
+test "decomposeRegex: backslash-w breaks chain" {
+    var q = try decomposeRegex("abc\\wdef", testing.allocator);
+    defer q.deinit();
+    // "abc" = 1 trigram, "def" = 1 trigram
+    try testing.expectEqual(@as(usize, 2), q.and_trigrams.len);
+}
+
+test "candidatesRegex: finds files with AND trigrams" {
+    var ti = TrigramIndex.init(testing.allocator);
+    defer ti.deinit();
+
+    try ti.indexFile("foo.zig", "pub fn recordSnapshot() void {}");
+    try ti.indexFile("bar.zig", "const x = 42;");
+
+    var q = try decomposeRegex("record.*Snapshot", testing.allocator);
+    defer q.deinit();
+    // Should extract trigrams from "record" and "Snapshot"
+    try testing.expect(q.and_trigrams.len > 0);
+
+    const cands = ti.candidatesRegex(&q);
+    defer if (cands) |c| testing.allocator.free(c);
+    try testing.expect(cands != null);
+    try testing.expect(cands.?.len >= 1);
+    // foo.zig should be a candidate
+    var found_foo = false;
+    for (cands.?) |p| {
+        if (std.mem.eql(u8, p, "foo.zig")) found_foo = true;
+    }
+    try testing.expect(found_foo);
+}
+
+test "candidatesRegex: OR groups union posting lists" {
+    var ti = TrigramIndex.init(testing.allocator);
+    defer ti.deinit();
+
+    try ti.indexFile("alpha.zig", "function foobar() {}");
+    try ti.indexFile("beta.zig", "function bazqux() {}");
+    try ti.indexFile("gamma.zig", "const x = 1;");
+
+    var q = try decomposeRegex("foobar|bazqux", testing.allocator);
+    defer q.deinit();
+    // All branch trigrams merged into single OR group
+    try testing.expectEqual(@as(usize, 1), q.or_groups.len);
+
+    const cands = ti.candidatesRegex(&q);
+    defer if (cands) |c| testing.allocator.free(c);
+    try testing.expect(cands != null);
+    // Both alpha.zig and beta.zig should be candidates
+    var found_alpha = false;
+    var found_beta = false;
+    for (cands.?) |p| {
+        if (std.mem.eql(u8, p, "alpha.zig")) found_alpha = true;
+        if (std.mem.eql(u8, p, "beta.zig")) found_beta = true;
+    }
+    try testing.expect(found_alpha or found_beta);
+}
+
+test "regexMatch: literal match" {
+    try testing.expect(regexMatch("hello world", "hello"));
+    try testing.expect(regexMatch("hello world", "world"));
+    try testing.expect(!regexMatch("hello world", "xyz"));
+}
+
+test "regexMatch: dot matches any char" {
+    try testing.expect(regexMatch("hello", "h.llo"));
+    try testing.expect(regexMatch("hello", "h..lo"));
+    try testing.expect(!regexMatch("hello", "h...lo"));
+}
+
+test "regexMatch: star quantifier" {
+    try testing.expect(regexMatch("helllo", "hel*o"));
+    try testing.expect(regexMatch("heo", "hel*o"));
+    try testing.expect(regexMatch("aab", "a*b"));
+}
+
+test "regexMatch: plus quantifier" {
+    try testing.expect(regexMatch("helllo", "hel+o"));
+    try testing.expect(!regexMatch("heo", "hel+o"));
+}
+
+test "regexMatch: question quantifier" {
+    try testing.expect(regexMatch("color", "colou?r"));
+    try testing.expect(regexMatch("colour", "colou?r"));
+}
+
+test "regexMatch: character class" {
+    try testing.expect(regexMatch("cat", "c[aeiou]t"));
+    try testing.expect(regexMatch("cot", "c[aeiou]t"));
+    try testing.expect(!regexMatch("cxt", "c[aeiou]t"));
+}
+
+test "regexMatch: negated character class" {
+    try testing.expect(!regexMatch("cat", "c[^aeiou]t"));
+    try testing.expect(regexMatch("cxt", "c[^aeiou]t"));
+}
+
+test "regexMatch: anchors" {
+    try testing.expect(regexMatch("hello", "^hello"));
+    try testing.expect(!regexMatch("say hello", "^hello"));
+    try testing.expect(regexMatch("hello", "hello$"));
+    try testing.expect(!regexMatch("hello world", "hello$"));
+}
+
+test "regexMatch: escape sequences" {
+    try testing.expect(regexMatch("abc123", "\\d+"));
+    try testing.expect(regexMatch("hello world", "\\w+\\s\\w+"));
+    try testing.expect(regexMatch("a.b", "a\\.b"));
+    try testing.expect(!regexMatch("axb", "a\\.b"));
+}
+
+test "regexMatch: alternation" {
+    try testing.expect(regexMatch("foo", "foo|bar"));
+    try testing.expect(regexMatch("bar", "foo|bar"));
+    try testing.expect(!regexMatch("baz", "foo|bar"));
+}
+
+test "regexMatch: dot-star" {
+    try testing.expect(regexMatch("hello world", "hello.*world"));
+    try testing.expect(regexMatch("helloworld", "hello.*world"));
+}
+
+test "explorer: searchContentRegex end-to-end" {
+    var explorer_inst = Explorer.init(testing.allocator);
+    defer explorer_inst.deinit();
+
+    try explorer_inst.indexFile("test1.zig", "pub fn recordSnapshot() void {}\nconst x = 42;");
+    try explorer_inst.indexFile("test2.zig", "pub fn recordState() void {}\nconst y = 99;");
+    try explorer_inst.indexFile("test3.zig", "const z = 0;\nfn other() void {}");
+
+    const results = try explorer_inst.searchContentRegex("record\\w+", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 2);
+    // Both test1 and test2 should have matches
+    var found1 = false;
+    var found2 = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "test1.zig")) found1 = true;
+        if (std.mem.eql(u8, r.path, "test2.zig")) found2 = true;
+    }
+    try testing.expect(found1);
+    try testing.expect(found2);
+}
+
+test "explorer: searchContentRegex no match" {
+    var explorer_inst = Explorer.init(testing.allocator);
+    defer explorer_inst.deinit();
+
+    try explorer_inst.indexFile("only.zig", "const x = 42;");
+
+    const results = try explorer_inst.searchContentRegex("zzz\\d+qqq", testing.allocator, 50);
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 0), results.len);
+}
+

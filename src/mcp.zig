@@ -37,7 +37,7 @@ const tools_list =
     \\{"name":"codedb_tree","description":"Get the full file tree of the indexed codebase with language detection, line counts, and symbol counts per file. Use this first to understand the project structure.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_outline","description":"Get the structural outline of a file: all functions, structs, enums, imports, constants with line numbers. Like an IDE symbol view.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find ALL definitions of a symbol name across the entire codebase. Returns every file and line where this symbol is defined. With body=true, includes source code.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Uses trigram index for fast substring matching. Returns matching lines with file paths and line numbers. With scope=true, annotates results with the enclosing function/struct.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Uses trigram index for fast substring matching. Returns matching lines with file paths and line numbers. With scope=true, annotates results with the enclosing function/struct. With regex=true, treats the query as a regex pattern and uses trigram decomposition for acceleration.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"O(1) word lookup using inverted index. Finds all occurrences of an exact word (identifier) across the codebase. Much faster than search for single-word queries.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"}},"required":["word"]}},
     \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Get reverse dependencies: which files import/depend on the given file. Useful for impact analysis.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"}},"required":["path"]}},
@@ -320,6 +320,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 50;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
+    const is_regex = getBool(args, "regex");
 
     if (scope) {
         const results = explorer.searchContentWithScope(query, alloc, max_results) catch {
@@ -348,10 +349,16 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             }
         }
     } else {
-        const results = explorer.searchContent(query, alloc, max_results) catch {
-            out.appendSlice(alloc, "error: search failed") catch {};
-            return;
-        };
+        const results = if (is_regex)
+            explorer.searchContentRegex(query, alloc, max_results) catch {
+                out.appendSlice(alloc, "error: regex search failed") catch {};
+                return;
+            }
+        else
+            explorer.searchContent(query, alloc, max_results) catch {
+                out.appendSlice(alloc, "error: search failed") catch {};
+                return;
+            };
         defer {
             for (results) |r| {
                 alloc.free(r.line_text);
