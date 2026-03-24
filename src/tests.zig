@@ -3170,7 +3170,7 @@ test "issue-45: snapshot written in non-git directory cannot be loaded" {
     const snap_path = try std.fs.path.join(aa, &.{ dir_path, "test.codedb" });
 
     // Write snapshot with a non-git root_path — git_head will be all-zeros
-    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, aa);
+    try snapshot_mod.writeSnapshot(&exp, "/tmp", snap_path, aa);
 
     // Snapshot file was created
     std.fs.cwd().access(snap_path, .{}) catch {
