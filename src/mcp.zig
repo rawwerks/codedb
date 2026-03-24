@@ -59,7 +59,7 @@ pub var last_activity: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 
 /// How long (ms) the server may sit idle before auto-exiting.
 /// Claude Code restarts MCP servers on demand, so this is safe.
-pub const idle_timeout_ms: i64 = 5 * 60 * 1000; // 5 minutes
+pub const idle_timeout_ms: i64 = 30 * 60 * 1000; // 30 minutes
 
 pub fn run(
     alloc: std.mem.Allocator,
