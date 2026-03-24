@@ -23,6 +23,7 @@ const WordTokenizer = @import("index.zig").WordTokenizer;
 const version = @import("version.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
+const snapshot_mod = @import("snapshot.zig");
 const Prerender = @import("prerender.zig").Prerender;
 const explore = @import("explore.zig");
 const extractLines = explore.extractLines;
@@ -3069,4 +3070,123 @@ test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allo
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
     for (threads) |t| t.join();
     try testing.expectEqual(@as(u32, 0), ctx.errors.load(.monotonic));
+}
+
+test "issue-39: sensitive file metadata leaks into snapshot TREE and OUTLINE sections" {
+    // Bug: writeSnapshot filters sensitive files from CONTENT section via isSensitivePath,
+    // but TREE and OUTLINE sections iterate explorer.outlines without filtering.
+    // This leaks .env file paths, line counts, byte sizes, and symbol names.
+    const allocator = testing.allocator;
+    var explorer = Explorer.init(allocator);
+    defer explorer.deinit();
+
+    // Index a sensitive file
+    try explorer.indexFile(".env", "SECRET_KEY=hunter2\nDB_PASS=letmein\n");
+    // Index a normal file
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    // Write snapshot to a temp file
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const snap_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(snap_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.snapshot", .{snap_path});
+    defer allocator.free(full_path);
+
+    try snapshot_mod.writeSnapshot(&explorer, ".", full_path, allocator);
+
+    // Read the snapshot file and check that .env does NOT appear in TREE/OUTLINE
+    const snap_content = try std.fs.cwd().readFileAlloc(allocator, full_path, 1024 * 1024);
+    defer allocator.free(snap_content);
+
+    // The TREE section is JSON containing file paths. If .env appears anywhere
+    // in the snapshot (outside CONTENT which is binary), it's a metadata leak.
+    // Search for ".env" in the non-binary sections (they're JSON/text).
+    const has_env_leak = std.mem.indexOf(u8, snap_content, ".env") != null;
+    try testing.expect(!has_env_leak);
+}
+
+test "issue-40: truncated snapshot silently loads partial data" {
+    // Bug: loadSnapshot returns file_count > 0 even when the content section
+    // is truncated. A partially-written snapshot should return false, not load
+    // an incomplete set of files.
+    const allocator = testing.allocator;
+    var explorer = Explorer.init(allocator);
+    defer explorer.deinit();
+
+    // Index several files
+    try explorer.indexFile("src/a.zig", "const a = 1;\n");
+    try explorer.indexFile("src/b.zig", "const b = 2;\n");
+    try explorer.indexFile("src/c.zig", "const c = 3;\n");
+
+    // Write a valid snapshot
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const snap_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(snap_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.snapshot", .{snap_path});
+    defer allocator.free(full_path);
+
+    try snapshot_mod.writeSnapshot(&explorer, ".", full_path, allocator);
+
+    // Read the snapshot, truncate it by chopping off the last 20 bytes
+    const snap_content = try std.fs.cwd().readFileAlloc(allocator, full_path, 1024 * 1024);
+    defer allocator.free(snap_content);
+
+    if (snap_content.len > 20) {
+        const truncated = snap_content[0 .. snap_content.len - 20];
+        const trunc_path = try std.fmt.allocPrint(allocator, "{s}/truncated.snapshot", .{snap_path});
+        defer allocator.free(trunc_path);
+        const trunc_file = try std.fs.cwd().createFile(trunc_path, .{});
+        try trunc_file.writeAll(truncated);
+        trunc_file.close();
+
+        // Try loading the truncated snapshot
+        var explorer2 = Explorer.init(allocator);
+        defer explorer2.deinit();
+        var store = Store.init(allocator);
+        defer store.deinit();
+
+        const loaded = snapshot_mod.loadSnapshot(trunc_path, &explorer2, &store, allocator);
+
+        // A truncated snapshot should NOT load successfully.
+        // Currently it returns true if even 1 file was loaded before truncation.
+        try testing.expect(!loaded);
+    }
+}
+
+test "issue-41: snapshot not validated against repo identity allows cross-project loading" {
+    // Bug: The only validation before loading a snapshot is git HEAD SHA match.
+    // There is no repo identity (e.g., remote URL or root path hash) embedded
+    // in the snapshot. Two repos at the same commit would cross-load snapshots.
+    const allocator = testing.allocator;
+    var explorer = Explorer.init(allocator);
+    defer explorer.deinit();
+
+    // Index files for "project A"
+    try explorer.indexFile("src/projectA.zig", "const project = \"A\";\n");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const snap_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(snap_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.snapshot", .{snap_path});
+    defer allocator.free(full_path);
+
+    try snapshot_mod.writeSnapshot(&explorer, ".", full_path, allocator);
+
+    // Load into a fresh explorer (simulating "project B")
+    var explorer2 = Explorer.init(allocator);
+    defer explorer2.deinit();
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // loadSnapshot does not check repo identity — it will load project A's data
+    const loaded = snapshot_mod.loadSnapshot(full_path, &explorer2, &store, allocator);
+
+    // This currently succeeds (loaded=true) — that's the bug.
+    // It should fail because there's no repo identity validation.
+    // Once fixed, loadSnapshot should embed and verify repo identity
+    // (e.g., hash of remote URL or root path) in the snapshot header.
+    try testing.expect(!loaded);
 }
