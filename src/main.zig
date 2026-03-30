@@ -278,7 +278,6 @@ pub fn main() !void {
         }
 
     } else if (std.mem.eql(u8, cmd, "search")) {
-        // Check for --regex flag
         var use_regex = false;
         var query_arg_start = cmd_args_start;
         if (args.len > cmd_args_start and std.mem.eql(u8, args[cmd_args_start], "--regex")) {
@@ -377,7 +376,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         const t0 = std.time.nanoTimestamp();
         const output = if (args.len > cmd_args_start) args[cmd_args_start] else "codedb.snapshot";
-        snapshot_mod.writeSnapshot(&explorer, abs_root, output, allocator) catch |err| {
+        snapshot_mod.writeSnapshotDual(&explorer, abs_root, output, allocator) catch |err| {
             out.p("{s}\xe2\x9c\x97{s} snapshot failed: {}\n", .{ s.red, s.reset, err });
             std.process.exit(1);
         };
@@ -418,7 +417,6 @@ pub fn main() !void {
 
         saveProjectInfo(allocator, data_dir, abs_root) catch {};
 
-        // Try loading from snapshot first for instant startup
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
         const snapshot_loaded = blk: {
             const snap_head = snapshot_mod.readSnapshotGitHead("codedb.snapshot") orelse break :blk false;
@@ -446,7 +444,7 @@ pub fn main() !void {
         const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
 
         std.log.info("codedb2 mcp: root={s} files={d} data={s}", .{ abs_root, store.currentSeq(), data_dir });
-        mcp_server.run(allocator, &store, &explorer, &agents);
+        mcp_server.run(allocator, &store, &explorer, &agents, abs_root);
 
         shutdown.store(true, .release);
         watch_thread.join();
@@ -460,7 +458,6 @@ pub fn main() !void {
         std.process.exit(1);
     }
 }
-
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp" };
     for (commands) |c| {
@@ -565,7 +562,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 explorer.mu.unlock();
                 scan_done.store(true, .release);
                 // Auto-write snapshot after successful scan
-                snapshot_mod.writeSnapshot(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
                 return;
@@ -582,7 +579,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
     scan_done.store(true, .release);
 
     // Auto-write snapshot after successful scan
-    snapshot_mod.writeSnapshot(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+    snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
 }
