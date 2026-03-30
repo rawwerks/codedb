@@ -76,11 +76,16 @@ pub fn writeSnapshot(
         var total_bytes: u64 = 0;
         var ct_iter = explorer.contents.valueIterator();
         while (ct_iter.next()) |v| total_bytes += v.*.len;
+        var file_count_meta: u32 = 0;
+        var fc_iter = explorer.outlines.keyIterator();
+        while (fc_iter.next()) |k| {
+            if (!isSensitivePath(k.*)) file_count_meta += 1;
+        }
 
         try writer.print(
             \\{{"file_count":{d},"total_bytes":{d},"indexed_at":{d},"format_version":{d}}}
         , .{
-            explorer.outlines.count(),
+            file_count_meta,
             total_bytes,
             std.time.timestamp(),
             FORMAT_VERSION,
@@ -99,6 +104,7 @@ pub fn writeSnapshot(
         var first = true;
         var iter = explorer.outlines.iterator();
         while (iter.next()) |entry| {
+            if (isSensitivePath(entry.key_ptr.*)) continue;
             if (!first) try writer.writeByte(',');
             first = false;
             const outline = entry.value_ptr;
@@ -127,6 +133,7 @@ pub fn writeSnapshot(
         var first = true;
         var iter = explorer.outlines.iterator();
         while (iter.next()) |entry| {
+            if (isSensitivePath(entry.key_ptr.*)) continue;
             if (!first) try writer.writeByte(',');
             first = false;
             try writer.print("\"{s}\":[", .{entry.key_ptr.*});

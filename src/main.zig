@@ -447,9 +447,9 @@ pub fn main() !void {
         var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
 
         var queue = watcher.EventQueue{};
+        var scan_thread: ?std.Thread = null;
         if (!snapshot_loaded) {
-            const scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done, data_dir, abs_root });
-            scan_thread.detach();
+            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done, data_dir, abs_root });
         }
 
         const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown, &scan_done });
@@ -460,6 +460,7 @@ pub fn main() !void {
         mcp_server.run(allocator, &store, &explorer, &agents, &prerender);
 
         shutdown.store(true, .release);
+        if (scan_thread) |st| st.join();
         watch_thread.join();
         isr_thread.join();
         idle_thread.join();
