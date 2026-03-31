@@ -82,13 +82,15 @@ pub fn writeSnapshot(
             if (!isSensitivePath(k.*)) file_count_meta += 1;
         }
 
+        const root_hash = std.hash.Wyhash.hash(0, root_path);
         try writer.print(
-            \\{{"file_count":{d},"total_bytes":{d},"indexed_at":{d},"format_version":{d}}}
+            \\{{"file_count":{d},"total_bytes":{d},"indexed_at":{d},"format_version":{d},"root_hash":{d}}}
         , .{
             file_count_meta,
             total_bytes,
             std.time.timestamp(),
             FORMAT_VERSION,
+            root_hash,
         });
         try file.writeAll(buf.items);
         try sections.append(allocator, .{ .id = @intFromEnum(SectionId.meta), .offset = offset, .length = buf.items.len });
@@ -274,8 +276,13 @@ pub fn readSectionBytes(path: []const u8, section_id: SectionId, allocator: std.
     defer sections.deinit();
 
     const entry = sections.get(@intFromEnum(section_id)) orelse return null;
+    if (entry.length > 256 * 1024 * 1024) return null; // sanity cap: 256MB
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
+
+    // Validate section fits within file
+    const stat = try file.stat();
+    if (entry.offset + entry.length > stat.size) return null;
 
     try file.seekTo(entry.offset);
     const buf = try allocator.alloc(u8, @intCast(entry.length));
@@ -317,6 +324,18 @@ pub fn loadSnapshot(
     store: *@import("store.zig").Store,
     allocator: std.mem.Allocator,
 ) bool {
+    return loadSnapshotValidated(snapshot_path, null, explorer, store, allocator);
+}
+
+/// Load a snapshot with optional repo identity validation.
+/// If `expected_root` is non-null, the snapshot's root_hash must match.
+pub fn loadSnapshotValidated(
+    snapshot_path: []const u8,
+    expected_root: ?[]const u8,
+    explorer: *Explorer,
+    store: *@import("store.zig").Store,
+    allocator: std.mem.Allocator,
+) bool {
     // Clean up stale temp files from previous crashed writers
     cleanupStaleTmpFiles(snapshot_path);
 
@@ -334,15 +353,49 @@ pub fn loadSnapshot(
     var sections = sections_opt orelse return false;
     defer sections.deinit();
 
+    // Parse META section to get expected file_count and root_hash
+    var expected_file_count: ?u32 = null;
+    var meta_root_hash: ?u64 = null;
+    if (sections.get(@intFromEnum(SectionId.meta))) |meta_entry| {
+        const meta_bytes = readSectionBytes(snapshot_path, .meta, allocator) catch null;
+        if (meta_bytes) |mb| {
+            defer allocator.free(mb);
+            // Simple integer extraction from JSON: "file_count":NNN
+            if (parseJsonU32(mb, "file_count")) |fc| {
+                expected_file_count = fc;
+            }
+            if (parseJsonU64(mb, "root_hash")) |rh| {
+                meta_root_hash = rh;
+            }
+            _ = meta_entry;
+        }
+    }
+
+    // Validate repo identity if requested (issue-41)
+    if (expected_root) |root| {
+        const expected_hash = std.hash.Wyhash.hash(0, root);
+        if (meta_root_hash) |stored_hash| {
+            if (stored_hash != expected_hash) return false;
+        } else {
+            // No root_hash in snapshot — reject if caller requires validation
+            return false;
+        }
+    }
+
     // Load CONTENT section — this is the core data
     const content_entry = sections.get(@intFromEnum(SectionId.content)) orelse return false;
 
     const content_file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
     defer content_file.close();
+
+    // Validate content section fits within actual file size (issue-40: truncation detection)
+    const file_stat = content_file.stat() catch return false;
+    const file_size = file_stat.size;
+    if (content_entry.offset + content_entry.length > file_size) return false;
+
     content_file.seekTo(content_entry.offset) catch return false;
 
-    const snap_mtime: i128 = if (content_file.stat() catch null) |s| s.mtime else 0;
-
+    const snap_mtime: i128 = file_stat.mtime;
     var bytes_read: u64 = 0;
     var file_count: u32 = 0;
     while (bytes_read < content_entry.length) {
@@ -351,6 +404,7 @@ pub fn loadSnapshot(
         const pln = content_file.readAll(&pl_buf) catch return false;
         if (pln != 2) break;
         const path_len = std.mem.readInt(u16, &pl_buf, .little);
+        if (path_len == 0 or path_len > 4096) break; // sanity cap
         bytes_read += 2;
 
         // Read path
@@ -365,6 +419,7 @@ pub fn loadSnapshot(
         const cln = content_file.readAll(&cl_buf) catch return false;
         if (cln != 4) break;
         const content_len = std.mem.readInt(u32, &cl_buf, .little);
+        if (content_len > 64 * 1024 * 1024) break; // sanity cap: 64MB per file
         bytes_read += 4;
 
         // Read content
@@ -394,6 +449,14 @@ pub fn loadSnapshot(
         _ = store.recordSnapshot(path_buf, effective.len, hash) catch {};
 
         file_count += 1;
+    }
+
+    // Validate file_count matches META expectation (issue-40)
+    if (expected_file_count) |expected| {
+        if (file_count != expected) return false;
+    } else if (file_count == 0) {
+        // No META and no files loaded — corrupt or empty snapshot
+        return false;
     }
 
     // Load frequency table if present
@@ -428,6 +491,32 @@ pub fn loadSnapshot(
     return true;
 }
 
+
+
+fn parseJsonU32(json: []const u8, key: []const u8) ?u32 {
+    const val = parseJsonU64(json, key) orelse return null;
+    return if (val <= std.math.maxInt(u32)) @intCast(val) else null;
+}
+
+fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
+    var i: usize = 0;
+    while (i + key.len + 2 <= json.len) : (i += 1) {
+        if (json[i] == '"' and
+            i + 1 + key.len + 1 <= json.len and
+            std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
+            json[i + 1 + key.len] == '"')
+        {
+            var j = i + 2 + key.len;
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) j += 1;
+            const start = j;
+            while (j < json.len and json[j] >= '0' and json[j] <= '9') j += 1;
+            if (j > start) {
+                return std.fmt.parseInt(u64, json[start..j], 10) catch null;
+            }
+        }
+    }
+    return null;
+}
 
 /// Returns true if a file path looks like it may contain secrets.
 /// These files are excluded from snapshots to prevent accidental exposure.

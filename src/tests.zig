@@ -3364,3 +3364,69 @@ test "issue-42: scan thread is joined before allocator-backed state is freed" {
     allocator.free(data_dir);
     _ = gpa.deinit();
 }
+
+test "issue-40: truncated snapshot silently loads partial data" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator());
+
+    try exp.indexFile("src/a.zig", "const a = 1;\n");
+    try exp.indexFile("src/b.zig", "const b = 2;\n");
+    try exp.indexFile("src/c.zig", "const c = 3;\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    const trunc_path = try std.fmt.allocPrint(testing.allocator, "{s}/trunc.codedb", .{dir_path});
+    defer testing.allocator.free(trunc_path);
+    {
+        const orig = try std.fs.cwd().readFileAlloc(testing.allocator, snap_path, 1024 * 1024);
+        defer testing.allocator.free(orig);
+        const trunc_file = try std.fs.cwd().createFile(trunc_path, .{});
+        defer trunc_file.close();
+        // Keep only header (256 bytes) — content section data will be missing
+        try trunc_file.writeAll(orig[0..@min(256, orig.len)]);
+    }
+
+    var arena2 = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator());
+    var store = Store.init(arena2.allocator());
+
+    const loaded = snapshot_mod.loadSnapshot(trunc_path, &exp2, &store, arena2.allocator());
+    try testing.expect(!loaded);
+}
+
+test "issue-41: snapshot not validated against repo identity allows cross-project loading" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator());
+
+    try exp.indexFile("src/projectA.zig", "const project = \"A\";\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshotValidated(snap_path, "/some/other/project", &exp2, &store, testing.allocator);
+    try testing.expect(!loaded);
+}
