@@ -61,6 +61,14 @@ fn mainImpl() !void {
         root = ".";
         cmd = "mcp";
         cmd_args_start = 2;
+    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v"))) {
+        root = ".";
+        cmd = "--version";
+        cmd_args_start = 2;
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "--help")) {
+        root = ".";
+        cmd = "--help";
+        cmd_args_start = 2;
     } else if (args.len < 2) {
         printUsage(out, s);
         std.process.exit(1);
@@ -75,6 +83,29 @@ fn mainImpl() !void {
     } else {
         printUsage(out, s);
         std.process.exit(1);
+    }
+
+    // Handle --version early (no root needed)
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "version")) {
+        out.p("codedb 0.2.3\n", .{});
+        return;
+    }
+
+    // Handle update command (re-runs the install script)
+    if (std.mem.eql(u8, cmd, "update")) {
+        out.p("updating codedb...\n", .{});
+        var child = std.process.Child.init(
+            &.{ "/bin/sh", "-c", "curl -fsSL https://codedb.codegraff.com/install.sh | sh" },
+            allocator,
+        );
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        _ = child.spawnAndWait() catch {
+            out.p("update failed\n", .{});
+            std.process.exit(1);
+        };
+        return;
     }
 
     if (std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, "${workspaceFolder}")) {
@@ -508,7 +539,7 @@ fn mainImpl() !void {
     }
 }
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp", "update" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }

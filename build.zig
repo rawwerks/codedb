@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
 
     // ── macOS ad-hoc codesign (prevents SIGKILL on unsigned binaries) ──
     if (target.result.os.tag == .macos) {
-        const codesign = b.addSystemCommand(&.{ "codesign", "-f", "-s", "-" });
+        const codesign = b.addSystemCommand(&.{ "codesign", "-f", "-s", "Developer ID Application: Rachit Pradhan (WWP9DLJ27P)" });
         codesign.addArtifactArg(exe);
         b.getInstallStep().dependOn(&codesign.step);
     }
