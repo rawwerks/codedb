@@ -503,6 +503,26 @@ fn mainImpl() !void {
         defer telem.deinit();
         telem.recordSessionStart();
 
+        // Singleton awareness: check/write PID file to detect duplicate instances
+        var pid_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const pid_path = std.fmt.bufPrint(&pid_path_buf, "{s}/mcp.pid", .{data_dir}) catch unreachable;
+        if (std.fs.cwd().readFileAlloc(allocator, pid_path, 32)) |contents| {
+            defer allocator.free(contents);
+            const trimmed = std.mem.trim(u8, contents, " \n\r\t\x00");
+            if (trimmed.len > 0) {
+                std.log.warn("another codedb mcp may be running for this project (see {s})", .{pid_path});
+            }
+        } else |_| {}
+
+        // Write our PID (best-effort — process ID via /proc or getpid)
+        if (std.fs.cwd().createFile(pid_path, .{ .truncate = true })) |f| {
+            defer f.close();
+            // Use std.Thread.getCurrentId as a proxy (it's the TID on Linux, PID on macOS)
+            var pidbuf: [32]u8 = undefined;
+            const pid_str = std.fmt.bufPrint(&pidbuf, "{d}\n", .{std.Thread.getCurrentId()}) catch "";
+            f.writeAll(pid_str) catch {};
+        } else |_| {}
+
         var shutdown = std.atomic.Value(bool).init(false);
         var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
 
@@ -530,6 +550,9 @@ fn mainImpl() !void {
         watch_thread.join();
         idle_thread.join();
         if (scan_thread) |t| t.join();
+
+        // Clean up PID lock
+        std.fs.cwd().deleteFile(pid_path) catch {};
     } else {
         out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, cmd, s.reset,
@@ -695,7 +718,6 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         explorer.releaseContents();
         explorer.releaseSecondaryIndexes();
     }
-}
 }
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
