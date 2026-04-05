@@ -334,8 +334,9 @@ pub const TrigramIndex = struct {
 
         const doc_id = try self.getOrCreateDocId(path);
 
-        var seen_trigrams = std.AutoHashMap(Trigram, void).init(self.allocator);
-        defer seen_trigrams.deinit();
+        // Phase 1: accumulate masks locally per trigram (no global index writes)
+        var local = std.AutoHashMap(Trigram, PostingMask).init(self.allocator);
+        defer local.deinit();
 
         if (content.len >= 3) {
             for (0..content.len - 2) |i| {
@@ -344,26 +345,38 @@ pub const TrigramIndex = struct {
                     normalizeChar(content[i + 1]),
                     normalizeChar(content[i + 2]),
                 );
-                const idx_gop = try self.index.getOrPut(tri);
-                if (!idx_gop.found_existing) {
-                    idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+                const gop = try local.getOrPut(tri);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = PostingMask{};
                 }
-                const posting = try idx_gop.value_ptr.getOrAddPosting(self.allocator, doc_id);
-                if (!seen_trigrams.contains(tri)) {
-                    try seen_trigrams.put(tri, {});
-                }
-                posting.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
                 if (i + 3 < content.len) {
-                    posting.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
                 }
             }
         }
 
+        // Phase 2: bulk-insert one posting per trigram into global index
         var tri_list: std.ArrayList(Trigram) = .{};
         errdefer tri_list.deinit(self.allocator);
-        var tri_iter = seen_trigrams.keyIterator();
-        while (tri_iter.next()) |tri_ptr| {
-            try tri_list.append(self.allocator, tri_ptr.*);
+
+        var local_iter = local.iterator();
+        while (local_iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            // Single append (not sorted insert) since doc_id is monotonically increasing
+            try idx_gop.value_ptr.items.append(self.allocator, .{
+                .doc_id = doc_id,
+                .next_mask = mask.next_mask,
+                .loc_mask = mask.loc_mask,
+            });
+
+            try tri_list.append(self.allocator, tri);
         }
         try self.file_trigrams.put(path, tri_list);
     }
