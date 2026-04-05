@@ -160,6 +160,23 @@ pub const Explorer = struct {
         if (self.root_dir) |*d| d.close();
     }
 
+    pub fn releaseContents(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var content_iter = self.contents.iterator();
+        while (content_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.contents.clearRetainingCapacity();
+    }
+
+    pub fn releaseSecondaryIndexes(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.sparse_ngram_index.deinit();
+        self.sparse_ngram_index = SparseNgramIndex.init(self.allocator);
+    }
+
     pub fn indexFile(self: *Explorer, path: []const u8, content: []const u8) !void {
         return self.indexFileInner(path, content, true, false);
     }
