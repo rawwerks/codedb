@@ -6,47 +6,139 @@ set -euo pipefail
 PORT="${CODEDB_PORT:-7719}"
 BASE="http://localhost:$PORT"
 BINARY="${CODEDB_BINARY:-codedb}"
+STARTUP_WAIT_STEPS="${CODEDB_STARTUP_WAIT_STEPS:-180}"
+STARTUP_WAIT_INTERVAL="${CODEDB_STARTUP_WAIT_INTERVAL:-0.2}"
+QUERY_SETTLE_STEPS="${CODEDB_QUERY_SETTLE_STEPS:-40}"
+QUERY_SETTLE_INTERVAL="${CODEDB_QUERY_SETTLE_INTERVAL:-0.5}"
+HOME_DIR="${HOME:-$(cd ~ && pwd)}"
+CACHE_BASE="${CODEDB_CACHE_BASE:-$HOME_DIR/.local/share/codedb-cli/root-snapshots}"
+SERVER_JUST_STARTED=0
 
 _ping() { curl -sf "$BASE/health" >/dev/null 2>&1; }
+_get() { curl -sf "$BASE$1"; }
+
+_current_daemon_pid() {
+    local daemon_pid=""
+    daemon_pid=$(ss -tlnp "sport = :$PORT" 2>/dev/null | awk '/LISTEN/{gsub(/.*pid=/,""); gsub(/,.*/,""); print; exit}')
+    if [ -z "$daemon_pid" ]; then
+        daemon_pid=$(lsof -ti ":$PORT" 2>/dev/null | head -1)
+    fi
+    printf '%s' "$daemon_pid"
+}
+
+_daemon_root_from_pid() {
+    local daemon_pid="$1"
+    local running_root=""
+    if [ -r "/proc/$daemon_pid/cmdline" ]; then
+        running_root=$(xargs -0 -n1 < "/proc/$daemon_pid/cmdline" 2>/dev/null | grep -B1 '^serve$' | head -1)
+        if [ -n "$running_root" ]; then
+            running_root="$(cd "$running_root" 2>/dev/null && pwd || echo "$running_root")"
+        fi
+    fi
+    printf '%s' "$running_root"
+}
+
+_wait_for_server() {
+    local i
+    for i in $(seq 1 "$STARTUP_WAIT_STEPS"); do
+        sleep "$STARTUP_WAIT_INTERVAL"
+        _ping && return 0
+    done
+    return 1
+}
+
+_query_jq_text() {
+    local endpoint="$1"
+    local jq_program="$2"
+    local output=""
+    local i
+
+    output=$(_get "$endpoint" | jq -r "$jq_program")
+    if [ -n "$output" ] || [ "$SERVER_JUST_STARTED" -eq 0 ]; then
+        printf '%s' "$output"
+        return 0
+    fi
+
+    for i in $(seq 1 "$QUERY_SETTLE_STEPS"); do
+        sleep "$QUERY_SETTLE_INTERVAL"
+        output=$(_get "$endpoint" | jq -r "$jq_program")
+        if [ -n "$output" ]; then
+            printf '%s' "$output"
+            return 0
+        fi
+    done
+
+    printf '%s' "$output"
+}
+
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+    fi
+}
+
+_root_cache_key() {
+    printf '%s' "$1" | _sha256
+}
+
+_root_cache_dir() {
+    local root="$1"
+    root="$(cd "$root" 2>/dev/null && pwd || echo "$root")"
+    printf '%s/%s' "$CACHE_BASE" "$(_root_cache_key "$root")"
+}
+
+_root_workdir() {
+    local root="$1"
+    local cache_dir
+    root="$(cd "$root" 2>/dev/null && pwd || echo "$root")"
+    cache_dir="$(_root_cache_dir "$root")"
+    if [ -f "$cache_dir/codedb.snapshot" ]; then
+        printf '%s' "$cache_dir"
+    else
+        printf '%s' "$root"
+    fi
+}
 
 _ensure_server() {
     local root="${1:-.}"
+    local daemon_pid=""
+    local running_root=""
+    local workdir=""
+    SERVER_JUST_STARTED=0
     root="$(cd "$root" 2>/dev/null && pwd || echo "$root")"
+    workdir="$(_root_workdir "$root")"
+
     if _ping; then
-        # Check if the running daemon is serving the requested root.
-        # Find the process listening on our port, then extract its root arg.
-        local daemon_pid running_root
-        daemon_pid=$(ss -tlnp "sport = :$PORT" 2>/dev/null | awk '/LISTEN/{gsub(/.*pid=/,""); gsub(/,.*/,""); print; exit}')
-        if [ -z "$daemon_pid" ]; then
-            # ss not available or no match — try lsof
-            daemon_pid=$(lsof -ti ":$PORT" 2>/dev/null | head -1)
-        fi
+        daemon_pid="$(_current_daemon_pid || true)"
         if [ -n "$daemon_pid" ]; then
-            # Read cmdline: argv is NUL-delimited in /proc. Parse directly to handle paths with spaces.
-            running_root=$(xargs -0 -n1 < "/proc/$daemon_pid/cmdline" 2>/dev/null | grep -B1 "^serve$" | head -1)
-            if [ -n "$running_root" ]; then
-                running_root="$(cd "$running_root" 2>/dev/null && pwd || echo "$running_root")"
-            fi
+            running_root="$(_daemon_root_from_pid "$daemon_pid" || true)"
         fi
         if [ -n "$running_root" ] && [ "$running_root" != "$root" ]; then
             echo "restarting codedb (root changed: $running_root -> $root)" >&2
-            [ -n "$daemon_pid" ] && kill "$daemon_pid" 2>/dev/null || true
+            kill "$daemon_pid" 2>/dev/null || true
             sleep 0.5
         else
             return 0
         fi
     fi
+
     echo "starting codedb $root serve ..." >&2
-    nohup "$BINARY" "$root" serve >/dev/null 2>&1 &
-    for i in $(seq 1 30); do
-        sleep 0.2
-        _ping && return 0
-    done
-    echo "error: codedb server failed to start" >&2
+    (
+        cd "$workdir"
+        nohup "$BINARY" "$root" serve >/dev/null 2>&1 &
+    )
+    if _wait_for_server; then
+        SERVER_JUST_STARTED=1
+        return 0
+    fi
+
+    echo "error: codedb server failed to start within ${STARTUP_WAIT_STEPS} checks" >&2
     return 1
 }
-
-_get() { curl -sf "$BASE$1"; }
 
 _urlencode() {
     local s="$1" c i len out=""
@@ -61,16 +153,137 @@ _urlencode() {
     printf '%s' "$out"
 }
 
-# --- arg parsing ---
-root=""
-cmd=""
+_machine_default_roots() {
+    cat <<EOF
+$HOME_DIR/Documents/GitHub
+$HOME_DIR/Documents/OpenProse-GitHub
+$HOME_DIR/raw-agent-private
+$HOME_DIR/.agents
+$HOME_DIR/.pi
+$HOME_DIR/.config
+$HOME_DIR/Documents/raw-obsidian-sync
+EOF
+}
 
-if [[ $# -ge 1 && -d "$1" ]]; then
-    root="$(cd "$1" && pwd)"
-    shift
-fi
+_machine_roots() {
+    local path
+    local -a machine_paths=()
+    if [ -n "${CODEDB_MACHINE_ROOTS:-}" ]; then
+        IFS=':' read -r -a machine_paths <<< "$CODEDB_MACHINE_ROOTS"
+        for path in "${machine_paths[@]}"; do
+            [ -n "$path" ] || continue
+            [ -d "$path" ] || continue
+            (cd "$path" && pwd)
+        done
+    else
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            [ -d "$path" ] || continue
+            (cd "$path" && pwd)
+        done < <(_machine_default_roots)
+    fi
+}
 
-if [[ $# -lt 1 ]]; then
+_machine_usage() {
+    cat >&2 <<'EOF'
+machine commands:
+  machine roots                   list default machine-wide roots
+  machine rebuild                 build cached snapshots for machine roots
+  machine status                  show health + seq for each machine root
+  machine search <query> [max]    search across machine roots
+  machine word <identifier> [max] exact word lookup across machine roots
+
+machine env:
+  CODEDB_MACHINE_ROOTS            colon-separated override for machine roots
+  CODEDB_CACHE_BASE               snapshot cache root for machine/per-root startup
+EOF
+}
+
+_machine_require_roots() {
+    mapfile -t MACHINE_ROOTS < <(_machine_roots)
+    if [ "${#MACHINE_ROOTS[@]}" -eq 0 ]; then
+        echo "error: no machine roots found (check CODEDB_MACHINE_ROOTS)" >&2
+        exit 1
+    fi
+}
+
+_machine_rebuild() {
+    local root cache_dir
+    _machine_require_roots
+    mkdir -p "$CACHE_BASE"
+    for root in "${MACHINE_ROOTS[@]}"; do
+        cache_dir="$(_root_cache_dir "$root")"
+        mkdir -p "$cache_dir"
+        printf '%s\n' "$root" > "$cache_dir/root.txt"
+        printf '==> %s <==\n' "$root"
+        (
+            cd "$cache_dir"
+            CODEDB_NO_TELEMETRY=1 "$BINARY" "$root" snapshot
+        )
+        printf '\n'
+    done
+}
+
+_machine_status() {
+    local root seq workdir
+    _machine_require_roots
+    for root in "${MACHINE_ROOTS[@]}"; do
+        workdir="$(_root_workdir "$root")"
+        printf '==> %s <==\n' "$root"
+        printf 'workdir: %s\n' "$workdir"
+        if _ensure_server "$root"; then
+            printf 'health: %s\n' "$(curl -sf "$BASE/health" | jq -r '.status')"
+            seq="$(_get '/seq' | jq -r '.seq')"
+            printf 'seq: %s\n\n' "$seq"
+        else
+            printf 'error: failed to start\n\n'
+        fi
+    done
+}
+
+_machine_search() {
+    local query="$1"
+    local max="${2:-10}"
+    local root json lines any=0
+    _machine_require_roots
+    for root in "${MACHINE_ROOTS[@]}"; do
+        if ! _ensure_server "$root"; then
+            printf '==> %s <==\nerror: failed to start\n\n' "$root"
+            continue
+        fi
+        lines=$(_query_jq_text "/explore/search?q=$(_urlencode "$query")&max=$max" '.results[]? | "\(.path):\(.line)\t\(.text)"')
+        [ -n "$lines" ] || continue
+        any=1
+        printf '==> %s <==\n' "$root"
+        printf '%s\n\n' "$lines"
+    done
+    if [ "$any" -eq 0 ]; then
+        printf 'no machine matches for: %s\n' "$query"
+    fi
+}
+
+_machine_word() {
+    local word="$1"
+    local max="${2:-20}"
+    local root json lines any=0
+    _machine_require_roots
+    for root in "${MACHINE_ROOTS[@]}"; do
+        if ! _ensure_server "$root"; then
+            printf '==> %s <==\nerror: failed to start\n\n' "$root"
+            continue
+        fi
+        lines=$(_query_jq_text "/explore/word?q=$(_urlencode "$word")" '.hits[]? | "\(.path):\(.line)"' | head -n "$max")
+        [ -n "$lines" ] || continue
+        any=1
+        printf '==> %s <==\n' "$root"
+        printf '%s\n\n' "$lines"
+    done
+    if [ "$any" -eq 0 ]; then
+        printf 'no machine word hits for: %s\n' "$word"
+    fi
+}
+
+_usage() {
     cat >&2 <<'EOF'
 codedb-cli — fast CLI for codedb daemon
 
@@ -87,40 +300,46 @@ commands:
   read    <path> [start] [end]  read file content (line range)
   status                        index status / health
   start   [root]                start the daemon
-  stop                          stop the daemon
+  stop                          stop all codedb daemons
+  machine <subcommand>          machine-wide workflow using curated roots
 
-env: CODEDB_PORT (default 7719), CODEDB_BINARY (default codedb)
-EOF
-    exit 1
-fi
-
-
-# Handle flags before commands
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    cat >&2 <<'HELP'
-codedb-cli — fast CLI for codedb daemon
-
-usage: codedb-cli [root] <command> [args...]
-
-commands:
-  tree                          file tree with symbol counts
-  outline <path>                symbols in a file
-  find    <symbol>              find symbol definitions
-  search  <query> [max]         trigram full-text search
-  word    <identifier>          O(1) inverted index lookup
-  hot     [limit]               recently modified files
-  deps    <path>                reverse dependency graph
-  read    <path> [start] [end]  read file content (line range)
-  status                        index status / health
-  start   [root]                start the daemon
-  stop                          stop the daemon
+machine:
+  machine roots                 list default machine-wide roots
+  machine rebuild               build cached snapshots for machine roots
+  machine status                show health + seq for each machine root
+  machine search <query> [max]  search across machine roots
+  machine word <word> [max]     exact word lookup across machine roots
 
 flags:
   --help, -h                    show this help
   --version, -v                 show version
 
-env: CODEDB_PORT (default 7719), CODEDB_BINARY (default codedb)
-HELP
+env:
+  CODEDB_PORT                   HTTP port (default 7719)
+  CODEDB_BINARY                 path to codedb binary
+  CODEDB_MACHINE_ROOTS          colon-separated override for machine roots
+  CODEDB_CACHE_BASE             snapshot cache root (default ~/.local/share/codedb-cli/root-snapshots)
+  CODEDB_STARTUP_WAIT_STEPS     number of 0.2s startup checks (default 180)
+  CODEDB_QUERY_SETTLE_STEPS     number of 0.5s retries after a fresh start (default 40)
+EOF
+}
+
+# --- arg parsing ---
+root=""
+cmd=""
+
+if [[ $# -ge 1 && -d "$1" ]]; then
+    root="$(cd "$1" && pwd)"
+    shift
+fi
+
+if [[ $# -lt 1 ]]; then
+    _usage
+    exit 1
+fi
+
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    _usage
     exit 0
 fi
 
@@ -132,7 +351,9 @@ if [[ "$1" == "--version" || "$1" == "-v" ]]; then
     fi
     exit 0
 fi
-cmd="$1"; shift
+
+cmd="$1"
+shift
 
 case "$cmd" in
     start)
@@ -140,52 +361,78 @@ case "$cmd" in
         echo "codedb running on :$PORT" >&2
         ;;
     stop)
-        if _ping; then
-            pkill -f "codedb.*serve" 2>/dev/null || true
-            echo "codedb stopped" >&2
-        else
-            echo "codedb not running" >&2
-        fi
+        pkill -f '(^|/)codedb( .*)? serve$' 2>/dev/null || true
+        echo "codedb stopped" >&2
+        ;;
+    machine)
+        subcmd="${1:-}"
+        case "$subcmd" in
+            roots)
+                _machine_roots
+                ;;
+            rebuild)
+                _machine_rebuild
+                ;;
+            status)
+                _machine_status
+                ;;
+            search)
+                [[ $# -lt 2 ]] && { echo "usage: codedb-cli machine search <query> [max]" >&2; exit 1; }
+                _machine_search "$2" "${3:-10}"
+                ;;
+            word)
+                [[ $# -lt 2 ]] && { echo "usage: codedb-cli machine word <identifier> [max]" >&2; exit 1; }
+                _machine_word "$2" "${3:-20}"
+                ;;
+            ""|help|-h|--help)
+                _machine_usage
+                ;;
+            *)
+                echo "unknown machine subcommand: $subcmd" >&2
+                _machine_usage
+                exit 1
+                ;;
+        esac
         ;;
     tree)
         _ensure_server "${root:-.}"
-        _get "/explore/tree" | jq -r '.tree'
+        _query_jq_text "/explore/tree" '.tree'
         ;;
     outline)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli outline <path>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _get "/explore/outline?path=$(_urlencode "$1")" | jq -r '.symbols[] | "L\(.line_start)\t\(.kind)\t\(.name)\t\(.detail // "")"'
+        _query_jq_text "/explore/outline?path=$(_urlencode "$1")" '.symbols[]? | "L\(.line_start)\t\(.kind)\t\(.name)\t\(.detail // \"\")"'
         ;;
     find|symbol)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli find <symbol>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _get "/explore/symbol?name=$(_urlencode "$1")" | jq -r '.results[] | "\(.path):\(.line)\t\(.kind)\t\(.detail // "")"'
+        _query_jq_text "/explore/symbol?name=$(_urlencode "$1")" '.results[]? | "\(.path):\(.line)\t\(.kind)\t\(.detail // \"\")"'
         ;;
     search)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli search <query> [max]" >&2; exit 1; }
         _ensure_server "${root:-.}"
         max="${2:-50}"
-        _get "/explore/search?q=$(_urlencode "$1")&max=$max" | jq -r '.results[] | "\(.path):\(.line)\t\(.text)"'
+        _query_jq_text "/explore/search?q=$(_urlencode "$1")&max=$max" '.results[]? | "\(.path):\(.line)\t\(.text)"'
         ;;
     word)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli word <identifier>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _get "/explore/word?q=$(_urlencode "$1")" | jq -r '.hits[] | "\(.path):\(.line)"'
+        _query_jq_text "/explore/word?q=$(_urlencode "$1")" '.hits[]? | "\(.path):\(.line)"'
         ;;
     hot)
         _ensure_server "${root:-.}"
         limit="${1:-10}"
-        _get "/explore/hot?limit=$limit" | jq -r '.files[]'
+        _query_jq_text "/explore/hot?limit=$limit" '.files[]?'
         ;;
     deps)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli deps <path>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _get "/explore/deps?path=$(_urlencode "$1")" | jq -r '.imported_by[]'
+        _query_jq_text "/explore/deps?path=$(_urlencode "$1")" '.imported_by[]?'
         ;;
     read)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli read <path> [start] [end]" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        content=$(_get "/file/read?path=$(_urlencode "$1")" | jq -r '.content')
+        content=$(_query_jq_text "/file/read?path=$(_urlencode "$1")" '.content')
         if [[ $# -ge 2 ]]; then
             start="$2"
             end="${3:-\$}"
@@ -201,6 +448,7 @@ case "$cmd" in
         ;;
     *)
         echo "unknown command: $cmd" >&2
+        _usage
         exit 1
         ;;
 esac
