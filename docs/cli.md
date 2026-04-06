@@ -21,7 +21,12 @@ codedb <root> serve              # HTTP daemon on localhost:7719
 codedb-cli <command>             # bash + curl + jq
 ```
 
-The daemon holds all indexes in memory and watches the filesystem for changes. The CLI is a ~120 line bash script that sends HTTP requests and formats the JSON output.
+The daemon holds per-repo indexes in memory and watches the filesystem for changes. The CLI wrapper handles two workflows:
+
+- focused per-repo structural queries via the codedb daemon
+- machine-wide discovery across curated roots via fast `rg` sweeps
+
+That split keeps machine-wide search practical on a real workstation while preserving codedb's structural strengths once you narrow to a repo.
 
 ## Install
 
@@ -48,7 +53,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now codedb
 ```
 
-Or just run queries — the CLI auto-starts the daemon if it's not running.
+But the local default is on-demand wrapper-managed startup. Do not keep a hardcoded single-project systemd daemon enabled if you also want reliable `codedb-cli` root switching.
 
 ## Commands
 
@@ -69,19 +74,53 @@ codedb-cli [root] <command> [args...]
 | `status` | Index health and sequence number | `codedb-cli status` |
 | `start [root]` | Start the daemon | `codedb-cli start .` |
 | `stop` | Stop the daemon | `codedb-cli stop` |
+| `machine roots` | Show curated machine-wide roots | `codedb-cli machine roots` |
+| `machine rebuild` | Cache codedb snapshots for smaller machine roots | `codedb-cli machine rebuild` |
+| `machine status` | Show per-root file counts + snapshot eligibility | `codedb-cli machine status` |
+| `machine search <query> [max]` | `rg`-backed machine-wide discovery search | `codedb-cli machine search "codedb-cli" 3` |
+| `machine word <identifier> [max]` | `rg -w -F` exact lookup across machine roots | `codedb-cli machine word asyncio 10` |
+
+## Machine Workflow
+
+The default machine roots mirror bm25x:
+
+- `~/Documents/GitHub`
+- `~/Documents/OpenProse-GitHub`
+- `~/raw-agent-private`
+- `~/.agents`
+- `~/.pi`
+- `~/.config`
+- `~/Documents/raw-obsidian-sync`
+
+Use the machine workflow to discover the right repo first:
+
+```bash
+codedb-cli machine roots
+codedb-cli machine status
+codedb-cli machine search "retry logic" 5
+codedb-cli machine word "asyncio" 10
+```
+
+`machine search` and `machine word` are intentionally `rg`-backed. Huge aggregate roots like `~/Documents/GitHub` are too large for a practical single codedb daemon/snapshot on this machine, so `machine rebuild` only caches snapshots for smaller roots and skips oversized ones.
+
+Override the root set when needed:
+
+```bash
+CODEDB_MACHINE_ROOTS=/abs/repo1:/abs/repo2 codedb-cli machine search Explorer 5
+```
 
 ## Daemon Management
 
 ```bash
-# systemd (if installed as a service)
+# systemd (if installed as a fixed single-project service)
 systemctl --user status codedb
 systemctl --user restart codedb       # re-indexes from scratch
 systemctl --user stop codedb
 journalctl --user -u codedb -f        # tail logs
 
-# manual
-codedb-cli start /path/to/project     # start daemon
-codedb-cli stop                       # stop daemon
+# wrapper-managed per-repo daemon
+codedb-cli start /path/to/project
+codedb-cli stop
 ```
 
 ## Environment Variables
@@ -90,6 +129,9 @@ codedb-cli stop                       # stop daemon
 |----------|---------|-------------|
 | `CODEDB_PORT` | `7719` | HTTP port for the daemon |
 | `CODEDB_BINARY` | `codedb` | Path to the codedb binary |
+| `CODEDB_MACHINE_ROOTS` | bm25x-style curated roots | Colon-separated machine root override |
+| `CODEDB_CACHE_BASE` | `~/.local/share/codedb-cli/root-snapshots` | Wrapper-owned snapshot cache root |
+| `CODEDB_MACHINE_SNAPSHOT_MAX_FILES` | `20000` | Skip cached snapshots above this file-count threshold |
 
 ## Performance
 
@@ -116,19 +158,23 @@ The CLI overhead is ~7ms (curl + jq) on top of the raw HTTP query time (~8ms).
 ## Examples
 
 ```bash
-# Explore a project
-codedb-cli tree | head -20
-codedb-cli outline src/main.zig
+# Machine-wide discovery first
+codedb-cli machine search "codedb-cli" 3
+codedb-cli machine word "asyncio" 10
+
+# Then switch to focused per-repo structural work
+codedb-cli /home/raw/Documents/GitHub/codedb tree | head -20
+codedb-cli /home/raw/Documents/GitHub/codedb outline src/main.zig
 
 # Find where a symbol is defined
-codedb-cli find Store
+codedb-cli /home/raw/Documents/GitHub/codedb find Store
 # src/store.zig:16  struct_def  pub const Store = struct {
 # src/explore.zig:2 import      const Store = @import("store.zig").Store;
 
-# Search and pipe to other tools
-codedb-cli search "error" | grep "server.zig"
-codedb-cli word "allocator" | wc -l
+# Search and pipe to other tools inside one repo
+codedb-cli /home/raw/Documents/GitHub/codedb search "error" | grep "server.zig"
+codedb-cli /home/raw/Documents/GitHub/codedb word "allocator" | wc -l
 
 # Read specific lines
-codedb-cli read src/explore.zig 106 130
+codedb-cli /home/raw/Documents/GitHub/codedb read src/explore.zig 106 130
 ```

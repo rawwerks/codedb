@@ -12,7 +12,61 @@ QUERY_SETTLE_STEPS="${CODEDB_QUERY_SETTLE_STEPS:-40}"
 QUERY_SETTLE_INTERVAL="${CODEDB_QUERY_SETTLE_INTERVAL:-0.5}"
 HOME_DIR="${HOME:-$(cd ~ && pwd)}"
 CACHE_BASE="${CODEDB_CACHE_BASE:-$HOME_DIR/.local/share/codedb-cli/root-snapshots}"
+MACHINE_SNAPSHOT_MAX_FILES="${CODEDB_MACHINE_SNAPSHOT_MAX_FILES:-20000}"
 SERVER_JUST_STARTED=0
+
+MACHINE_RG_ARGS=(
+    --hidden
+    --no-messages
+    --glob '*.{zig,c,h,cpp,hpp,py,js,jsx,ts,tsx,rs,go,php,rb,rake,md,json,yaml,yml}'
+    -g '!**/.git/**'
+    -g '!**/.claude/**'
+    -g '!**/.codedb/**'
+    -g '!**/node_modules/**'
+    -g '!**/.zig-cache/**'
+    -g '!**/zig-out/**'
+    -g '!**/.next/**'
+    -g '!**/.nuxt/**'
+    -g '!**/.svelte-kit/**'
+    -g '!**/dist/**'
+    -g '!**/build/**'
+    -g '!**/.build/**'
+    -g '!**/.output/**'
+    -g '!**/out/**'
+    -g '!**/__pycache__/**'
+    -g '!**/.venv/**'
+    -g '!**/venv/**'
+    -g '!**/.env/**'
+    -g '!**/.tox/**'
+    -g '!**/.mypy_cache/**'
+    -g '!**/.pytest_cache/**'
+    -g '!**/.ruff_cache/**'
+    -g '!**/target/**'
+    -g '!**/.gradle/**'
+    -g '!**/.idea/**'
+    -g '!**/.vs/**'
+    -g '!**/vendor/**'
+    -g '!**/Pods/**'
+    -g '!**/.dart_tool/**'
+    -g '!**/.pub-cache/**'
+    -g '!**/coverage/**'
+    -g '!**/.nyc_output/**'
+    -g '!**/.turbo/**'
+    -g '!**/.parcel-cache/**'
+    -g '!**/.cache/**'
+    -g '!**/.tmp/**'
+    -g '!**/.temp/**'
+    -g '!**/bundle/**'
+    -g '!**/.bundle/**'
+    -g '!**/.ssh/**'
+    -g '!**/.gnupg/**'
+    -g '!**/.aws/**'
+    -g '!**/credentials.json'
+    -g '!**/service-account.json'
+    -g '!**/secrets.json'
+    -g '!**/secrets.yaml'
+    -g '!**/secrets.yml'
+)
 
 _ping() { curl -sf "$BASE/health" >/dev/null 2>&1; }
 _get() { curl -sf "$BASE$1"; }
@@ -39,10 +93,14 @@ _daemon_root_from_pid() {
 }
 
 _wait_for_server() {
+    local server_pid="${1:-}"
     local i
     for i in $(seq 1 "$STARTUP_WAIT_STEPS"); do
         sleep "$STARTUP_WAIT_INTERVAL"
         _ping && return 0
+        if [ -n "$server_pid" ] && ! kill -0 "$server_pid" 2>/dev/null; then
+            return 1
+        fi
     done
     return 1
 }
@@ -103,11 +161,19 @@ _root_workdir() {
     fi
 }
 
+_machine_file_count() {
+    local root="$1"
+    local count
+    count="$(rg --files "${MACHINE_RG_ARGS[@]}" "$root" | wc -l | tr -d ' ')"
+    printf '%s' "${count:-0}"
+}
+
 _ensure_server() {
     local root="${1:-.}"
     local daemon_pid=""
     local running_root=""
     local workdir=""
+    local started_pid=""
     SERVER_JUST_STARTED=0
     root="$(cd "$root" 2>/dev/null && pwd || echo "$root")"
     workdir="$(_root_workdir "$root")"
@@ -127,15 +193,20 @@ _ensure_server() {
     fi
 
     echo "starting codedb $root serve ..." >&2
-    (
+    started_pid="$({
         cd "$workdir"
         nohup "$BINARY" "$root" serve >/dev/null 2>&1 &
-    )
-    if _wait_for_server; then
+        echo $!
+    })"
+    if _wait_for_server "$started_pid"; then
         SERVER_JUST_STARTED=1
         return 0
     fi
 
+    if [ -n "$started_pid" ] && kill -0 "$started_pid" 2>/dev/null; then
+        kill "$started_pid" 2>/dev/null || true
+        sleep 0.5
+    fi
     echo "error: codedb server failed to start within ${STARTUP_WAIT_STEPS} checks" >&2
     return 1
 }
@@ -188,14 +259,16 @@ _machine_usage() {
     cat >&2 <<'EOF'
 machine commands:
   machine roots                   list default machine-wide roots
-  machine rebuild                 build cached snapshots for machine roots
-  machine status                  show health + seq for each machine root
-  machine search <query> [max]    search across machine roots
-  machine word <identifier> [max] exact word lookup across machine roots
+  machine rebuild                 build cached snapshots for smaller machine roots
+  machine status                  show machine search mode + snapshot status per root
+  machine search <query> [max]    rg-backed search across machine roots
+  machine word <identifier> [max] rg-backed exact word lookup across machine roots
 
 machine env:
   CODEDB_MACHINE_ROOTS            colon-separated override for machine roots
-  CODEDB_CACHE_BASE               snapshot cache root for machine/per-root startup
+  CODEDB_CACHE_BASE               snapshot cache root for smaller machine roots
+  CODEDB_MACHINE_SNAPSHOT_MAX_FILES
+                                 skip cached snapshots above this file-count threshold
 EOF
 }
 
@@ -208,14 +281,23 @@ _machine_require_roots() {
 }
 
 _machine_rebuild() {
-    local root cache_dir
+    local root cache_dir file_count
     _machine_require_roots
     mkdir -p "$CACHE_BASE"
     for root in "${MACHINE_ROOTS[@]}"; do
         cache_dir="$(_root_cache_dir "$root")"
         mkdir -p "$cache_dir"
         printf '%s\n' "$root" > "$cache_dir/root.txt"
+        file_count="$(_machine_file_count "$root")"
+        printf '%s\n' "$file_count" > "$cache_dir/file-count.txt"
         printf '==> %s <==\n' "$root"
+        printf 'files: %s\n' "$file_count"
+        if [ "$file_count" -gt "$MACHINE_SNAPSHOT_MAX_FILES" ]; then
+            rm -f "$cache_dir/codedb.snapshot"
+            printf 'skip snapshot: %s files exceeds CODEDB_MACHINE_SNAPSHOT_MAX_FILES=%s\n' "$file_count" "$MACHINE_SNAPSHOT_MAX_FILES"
+            printf 'machine search/word use rg for this root\n\n'
+            continue
+        fi
         (
             cd "$cache_dir"
             CODEDB_NO_TELEMETRY=1 "$BINARY" "$root" snapshot
@@ -225,18 +307,29 @@ _machine_rebuild() {
 }
 
 _machine_status() {
-    local root seq workdir
+    local root cache_dir workdir file_count
     _machine_require_roots
     for root in "${MACHINE_ROOTS[@]}"; do
+        cache_dir="$(_root_cache_dir "$root")"
         workdir="$(_root_workdir "$root")"
+        file_count="$(_machine_file_count "$root")"
         printf '==> %s <==\n' "$root"
+        printf 'files: %s\n' "$file_count"
         printf 'workdir: %s\n' "$workdir"
-        if _ensure_server "$root"; then
-            printf 'health: %s\n' "$(curl -sf "$BASE/health" | jq -r '.status')"
-            seq="$(_get '/seq' | jq -r '.seq')"
-            printf 'seq: %s\n\n' "$seq"
+        if [ "$file_count" -gt "$MACHINE_SNAPSHOT_MAX_FILES" ]; then
+            printf 'mode: rg-only (root too large for a practical single codedb snapshot)\n'
+            if [ -f "$cache_dir/codedb.snapshot" ]; then
+                printf 'snapshot: present but ignored (> %s files)\n\n' "$MACHINE_SNAPSHOT_MAX_FILES"
+            else
+                printf 'snapshot: skipped (> %s files)\n\n' "$MACHINE_SNAPSHOT_MAX_FILES"
+            fi
         else
-            printf 'error: failed to start\n\n'
+            printf 'mode: rg + optional cached codedb snapshot\n'
+            if [ -f "$cache_dir/codedb.snapshot" ]; then
+                printf 'snapshot: present\n\n'
+            else
+                printf 'snapshot: missing (run codedb-cli machine rebuild)\n\n'
+            fi
         fi
     done
 }
@@ -244,14 +337,14 @@ _machine_status() {
 _machine_search() {
     local query="$1"
     local max="${2:-10}"
-    local root json lines any=0
+    local root lines any=0
     _machine_require_roots
     for root in "${MACHINE_ROOTS[@]}"; do
-        if ! _ensure_server "$root"; then
-            printf '==> %s <==\nerror: failed to start\n\n' "$root"
-            continue
-        fi
-        lines=$(_query_jq_text "/explore/search?q=$(_urlencode "$query")&max=$max" '.results[]? | "\(.path):\(.line)\t\(.text)"')
+        lines="$(
+            rg -n "${MACHINE_RG_ARGS[@]}" -F -- "$query" "$root" |
+            head -n "$max" |
+            sed -E 's/^(.+):([0-9]+):(.*)$/\1:\2\t\3/' || true
+        )"
         [ -n "$lines" ] || continue
         any=1
         printf '==> %s <==\n' "$root"
@@ -265,14 +358,14 @@ _machine_search() {
 _machine_word() {
     local word="$1"
     local max="${2:-20}"
-    local root json lines any=0
+    local root lines any=0
     _machine_require_roots
     for root in "${MACHINE_ROOTS[@]}"; do
-        if ! _ensure_server "$root"; then
-            printf '==> %s <==\nerror: failed to start\n\n' "$root"
-            continue
-        fi
-        lines=$(_query_jq_text "/explore/word?q=$(_urlencode "$word")" '.hits[]? | "\(.path):\(.line)"' | head -n "$max")
+        lines="$(
+            rg -n "${MACHINE_RG_ARGS[@]}" -w -F -- "$word" "$root" |
+            head -n "$max" |
+            sed -E 's/^(.+):([0-9]+):.*$/\1:\2/' || true
+        )"
         [ -n "$lines" ] || continue
         any=1
         printf '==> %s <==\n' "$root"
@@ -305,10 +398,10 @@ commands:
 
 machine:
   machine roots                 list default machine-wide roots
-  machine rebuild               build cached snapshots for machine roots
-  machine status                show health + seq for each machine root
-  machine search <query> [max]  search across machine roots
-  machine word <word> [max]     exact word lookup across machine roots
+  machine rebuild               build cached snapshots for smaller machine roots
+  machine status                show machine search mode + snapshot status per root
+  machine search <query> [max]  rg-backed search across machine roots
+  machine word <word> [max]     rg-backed exact word lookup across machine roots
 
 flags:
   --help, -h                    show this help
@@ -319,6 +412,8 @@ env:
   CODEDB_BINARY                 path to codedb binary
   CODEDB_MACHINE_ROOTS          colon-separated override for machine roots
   CODEDB_CACHE_BASE             snapshot cache root (default ~/.local/share/codedb-cli/root-snapshots)
+  CODEDB_MACHINE_SNAPSHOT_MAX_FILES
+                                skip cached snapshots above this file-count threshold (default 20000)
   CODEDB_STARTUP_WAIT_STEPS     number of 0.2s startup checks (default 180)
   CODEDB_QUERY_SETTLE_STEPS     number of 0.5s retries after a fresh start (default 40)
 EOF
