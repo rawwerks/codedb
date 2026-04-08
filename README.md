@@ -64,7 +64,7 @@
 ## ⚡ Install
 
 ```bash
-curl -fsSL https://codedb.codegraff.com/install.sh | sh
+curl -fsSL https://codedb.codegraff.com/install.sh | bash
 ```
 
 Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**.

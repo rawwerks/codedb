@@ -22,7 +22,7 @@ fn page() h.Node {
         h.h2(.{}, "1. Install"),
         h.p(.{}, "One command. Downloads the binary for your platform and auto-registers codedb as an MCP server in Claude Code, Codex, Gemini CLI, and Cursor."),
         h.pre(.{},
-            \\curl -fsSL https://codedb.codegraff.com/install.sh | sh
+            \\curl -fsSL https://codedb.codegraff.com/install.sh | bash
         ),
         h.p(.{}, "Supports macOS (ARM64, x86_64) and Linux (ARM64, x86_64). macOS binaries are codesigned and notarized."),
 

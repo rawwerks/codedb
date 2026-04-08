@@ -22,7 +22,7 @@ detect_platform() {
       printf "  ${Y}Windows detected${N} — codedb is a native Linux/macOS binary.\n"
       printf "  Run this inside ${G}WSL2${N} instead:\n"
       echo ""
-      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | sh${N}\n"
+      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | bash${N}\n"
       echo ""
       exit 0
       ;;
@@ -182,9 +182,10 @@ main() {
   printf "  ${D}│${N} %-12s " "codedb"
   local tmp="/tmp/codedb.tmp.$$"
   if curl -fsSL -A 'codedb-installer' "$url" -o "$tmp" 2>/dev/null; then
-    # Verify checksum if available (#120)
-    local expected_hash
-    expected_hash="$(curl -fsSL -A 'codedb-installer' "$checksum_url" 2>/dev/null | grep "codedb-${platform}${ext}" | awk '{print $1}')"
+    # Verify checksum when the release publishes a checksum manifest.
+    local checksum_text expected_hash checksum_notice=""
+    checksum_text="$(curl -fsSL -A 'codedb-installer' "$checksum_url" 2>/dev/null || true)"
+    expected_hash="$(printf '%s\n' "$checksum_text" | awk "/codedb-${platform}${ext}\$/ { print \$1 }")"
     if [ -n "$expected_hash" ]; then
       local actual_hash
       if command -v sha256sum >/dev/null 2>&1; then
@@ -200,6 +201,8 @@ main() {
         printf "  ${D}actual:   $actual_hash${N}\n" >&2
         exit 1
       fi
+    else
+      checksum_notice="  ${Y}warning:${N} checksum verification skipped (checksums.sha256 unavailable)\n"
     fi
     xattr -c "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$dest"
@@ -214,6 +217,9 @@ main() {
 
   echo ""
   printf "  ${G}installed${N} ${D}→ $dest${N}\n"
+  if [ -n "$checksum_notice" ]; then
+    printf "$checksum_notice"
+  fi
 
   # Register MCP server in coding tools
   echo ""

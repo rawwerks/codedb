@@ -22,7 +22,7 @@ detect_platform() {
       printf "  ${Y}Windows detected${N} — codedb is a native Linux/macOS binary.\n"
       printf "  Run this inside ${G}WSL2${N} instead:\n"
       echo ""
-      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | sh${N}\n"
+      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | bash${N}\n"
       echo ""
       exit 0
       ;;

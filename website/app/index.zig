@@ -164,7 +164,7 @@ const html =
     \\  </div>
     \\  <div class="hero-sub">Sub-millisecond queries. Zero dependencies. Pure Zig. 12 MCP tools that give your agent structural understanding of any codebase.</div>
     \\  <div class="hero-install">
-    \\    <span class="prompt">$</span> curl -fsSL https://codedb.codegraff.com/install.sh | sh
+    \\    <span class="prompt">$</span> curl -fsSL https://codedb.codegraff.com/install.sh | bash
     \\  </div>
     \\  <div class="hero-actions">
     \\    <a href="/quickstart" class="btn">Get started</a>
@@ -350,7 +350,7 @@ const html =
     \\    <div class="cta-title">Give your agent a brain</div>
     \\    <div class="cta-sub">One command. Auto-registers in Claude Code, Codex, Gemini CLI, and Cursor.</div>
     \\    <div class="hero-install" style="margin:0 auto 20px;justify-content:center;">
-    \\      <span class="prompt">$</span> curl -fsSL https://codedb.codegraff.com/install.sh | sh
+    \\      <span class="prompt">$</span> curl -fsSL https://codedb.codegraff.com/install.sh | bash
     \\    </div>
     \\    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
     \\      <a href="/quickstart" class="btn">Quick start guide</a>
