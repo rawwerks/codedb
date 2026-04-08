@@ -494,7 +494,7 @@ def write_hit_cache(cwd: str, message: str, hits: List[Hit]) -> None:
     if not hits:
         return
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
         path = cwd_cache_path(cwd)
         payload = {
             "cwd": os.path.realpath(cwd),

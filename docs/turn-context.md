@@ -141,7 +141,7 @@ Wire it into `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/home/you/.claude/hooks/codedb-prompt-context.sh",
+            "command": "~/.claude/hooks/codedb-prompt-context.sh",
             "timeout": 3
           }
         ]
