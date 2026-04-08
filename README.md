@@ -204,6 +204,33 @@ curl "localhost:7719/changes?since=42"
 
 ---
 
+## 🧠 Turn-context prefetch (for agents)
+
+`scripts/codedb-turn-context` is a small Python helper that prefetches a
+compact block of code-local context on every agent turn — designed to be
+invoked from per-agent adapters (Claude Code hooks, pi extensions, Codex
+launchers) so the model sees relevant file paths and snippets before it
+decides what to open. Typical latency is 150–400 ms for a high-signal
+prompt; low-signal prompts skip the query and return nothing.
+
+```bash
+cp scripts/codedb-turn-context ~/.local/bin/codedb-turn-context
+codedb-turn-context 'where is `handleAuth` defined?'
+```
+
+It extracts high-specificity literals from the message (backticks, quotes,
+paths, compound identifiers, error phrases), runs up to two `codedb-cli
+machine` queries, and emits a re-ranked `[fast-local-context]` block with
+optional per-hit `expand <id>` support.
+
+Personal path aliases live in a per-user TOML config
+(`~/.config/codedb-turn-context.toml`) — see
+[`scripts/codedb-turn-context.config.example.toml`](scripts/codedb-turn-context.config.example.toml).
+The config is gitignored so personal layout never leaks to the public repo.
+Full details and adapter examples in [`docs/turn-context.md`](docs/turn-context.md).
+
+---
+
 ## 📊 Benchmarks
 
 Measured on Apple M4 Pro, 48GB RAM. MCP = pre-indexed warm queries (20 iterations avg). CLI/external tools include process startup (3 iterations avg). Ground truth verified against Python reference implementation.

@@ -23,3 +23,11 @@ codedb.snapshot
 release/
 release/
 socials/
+
+# Per-user codedb-turn-context config (private — never committed).
+# Users put their real [path_aliases] mapping in ~/.config/codedb-turn-context.toml
+# or in an in-repo local override at this path (gitignored so personal layout
+# never leaks to the public repo).
+scripts/codedb-turn-context.local.toml
+scripts/codedb-turn-context.toml
+scripts/__pycache__/

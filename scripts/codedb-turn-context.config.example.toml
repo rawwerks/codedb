@@ -1,0 +1,24 @@
+# codedb-turn-context per-user config.
+#
+# Copy this file to one of these locations (first found wins):
+#   1. The path in $CODEDB_TURN_CONTEXT_CONFIG (explicit override)
+#   2. $XDG_CONFIG_HOME/codedb-turn-context.toml (if XDG_CONFIG_HOME is set)
+#   3. ~/.config/codedb-turn-context.toml
+#
+# Or pass --config <path> directly to codedb-turn-context.
+#
+# With no config present, codedb-turn-context prints hits using a basename
+# derived from the codedb root (e.g. "github/myproj/src/main.rs"). The config
+# below just lets you pick shorter or more recognizable display aliases.
+
+# Map a short alias (the key) to an absolute directory (the value). Any hit
+# whose path starts with the directory is rendered with "<alias>/<rel>" in the
+# [fast-local-context] block, which keeps the output compact and lets agents
+# scan it quickly. Keys should be 2-6 uppercase letters; values must be
+# absolute paths (tildes are expanded).
+#
+# Example layout for a developer whose code lives under ~/src:
+[path_aliases]
+"GH"   = "~/src/github"
+"WORK" = "~/src/work"
+"NOTES" = "~/Documents/notes"

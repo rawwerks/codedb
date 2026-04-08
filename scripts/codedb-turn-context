@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""
+codedb-turn-context — compact machine-wide context prefetch for agent turns.
+
+A standalone Python helper that extracts high-specificity literals from a raw
+user message and runs a couple of codedb-cli machine queries to emit a compact
+[fast-local-context] block or JSON. Designed to be invoked from agent adapters
+(Claude Code hooks, pi extensions, etc.) on every turn.
+
+Personal paths — the map from absolute directories to short display aliases —
+are loaded from a per-user TOML config at runtime. With no config the script
+prints hits using a basename-derived short form, so no personal layout is
+encoded here. See scripts/codedb-turn-context.config.example.toml in the
+codedb repo for the schema.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess  # nosec B404 — this script is a codedb-cli launcher; subprocess is required
+import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
+
+CACHE_DIR = os.path.expanduser("~/.cache/codedb-turn-context")
+
+CODE_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx",
+    ".php", ".py", ".rb", ".rs", ".sh", ".ts", ".tsx", ".zig",
+}
+DOC_EXTENSIONS = {".md", ".rst", ".txt"}
+DEFINITION_RE = re.compile(
+    r"\b(class|const|def|enum|fn|func|function|impl|interface|let|proc|pub|struct|trait|type|var)\b"
+)
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by",
+    "can", "could", "did", "do", "does", "for", "from", "get", "got", "had",
+    "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "just",
+    "let", "lets", "make", "me", "my", "need", "now", "of", "on", "or", "our",
+    "out", "please", "should", "so", "still", "tell", "that", "the", "their",
+    "them", "then", "there", "these", "they", "this", "those", "to", "too", "up",
+    "us", "use", "want", "was", "we", "were", "what", "when", "where", "which",
+    "who", "why", "with", "would", "you", "your",
+}
+
+TECH_HINTS = {
+    "agent", "auth", "bench", "build", "bundle", "cache", "cli", "context", "crash",
+    "daemon", "deps", "edit", "error", "failure", "find", "grep", "health", "hook",
+    "index", "install", "logic", "mcp", "outline", "query", "read", "retry", "root",
+    "search", "server", "snapshot", "startup", "status", "symbol", "telemetry", "timeout",
+    "tool", "trace", "tree", "watch", "watcher", "word",
+}
+PREPOSITION_HINTS = {"at", "by", "during", "from", "in", "inside", "on", "within"}
+
+# Populated at runtime from the per-user config. See load_path_aliases().
+# Mapping: absolute_directory -> short_alias (e.g. "/home/alice/src/github" -> "GH").
+PATH_ROOTS: dict = {}
+
+PATH_OR_FILE_RE = re.compile(
+    r"(?:(?:~|/)[A-Za-z0-9_./~:-]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+\.(?:zig|py|ts|tsx|js|jsx|rs|go|md|json|yaml|yml|toml|sh|bash|txt))"
+)
+FLAG_RE = re.compile(r"--[A-Za-z0-9][A-Za-z0-9-]*")
+COMPOUND_RE = re.compile(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b")
+CAMEL_RE = re.compile(r"\b(?:[a-z]+[A-Z][A-Za-z0-9]*|[A-Z][A-Za-z0-9]{2,})\b")
+WORD_RE = re.compile(r"\b[A-Za-z0-9_.-]+\b")
+SEARCH_LINE_RE = re.compile(r"^(.*):(\d+)\t(.*)$")
+WORD_LINE_RE = re.compile(r"^(.*):(\d+)$")
+
+
+def _candidate_config_paths(explicit: Optional[str]) -> List[str]:
+    """
+    Return the ordered list of config file paths to try. First existing wins.
+
+    Resolution order:
+      1. --config CLI flag (exclusive: that path or nothing)
+      2. $CODEDB_TURN_CONTEXT_CONFIG env var (exclusive: that path or nothing)
+      3. $XDG_CONFIG_HOME/codedb-turn-context.toml (if XDG_CONFIG_HOME is set)
+      4. ~/.config/codedb-turn-context.toml
+
+    Forms (1) and (2) are exclusive — if either is set, the defaults are not
+    tried. This matches git's GIT_CONFIG_GLOBAL semantics and lets tests force
+    an empty config by pointing the env var at a nonexistent file.
+    """
+    if explicit:
+        return [os.path.expanduser(explicit)]
+    env_override = os.environ.get("CODEDB_TURN_CONTEXT_CONFIG")
+    if env_override is not None:
+        return [os.path.expanduser(env_override)] if env_override else []
+    paths: List[str] = []
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        paths.append(os.path.join(xdg, "codedb-turn-context.toml"))
+    paths.append(os.path.expanduser("~/.config/codedb-turn-context.toml"))
+    return paths
+
+
+def load_path_aliases(explicit: Optional[str] = None) -> dict:
+    """
+    Load the [path_aliases] table from the first existing config file.
+    Returns a dict of absolute_path -> short_alias. On any error (missing file,
+    malformed TOML, wrong types) returns an empty dict and logs a one-line
+    warning to stderr so the script keeps working.
+    """
+    if tomllib is None:
+        return {}
+    for candidate in _candidate_config_paths(explicit):
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "rb") as fh:
+                data = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            print(f"codedb-turn-context: ignoring malformed config {candidate}: {exc}", file=sys.stderr)
+            return {}
+        section = data.get("path_aliases") or {}
+        if not isinstance(section, dict):
+            print(f"codedb-turn-context: [path_aliases] in {candidate} is not a table, ignoring", file=sys.stderr)
+            return {}
+        # Keys in the TOML are the short aliases, values are absolute paths.
+        # The in-memory map is inverted to abs_path -> alias for fast prefix matching.
+        aliases: dict = {}
+        for alias, raw_path in section.items():
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            abs_path = os.path.expanduser(raw_path).rstrip(os.sep)
+            if abs_path:
+                aliases[abs_path] = str(alias)
+        return aliases
+    return {}
+
+
+@dataclass
+class Candidate:
+    query: str
+    mode: str
+    source: str
+    score: int
+
+
+@dataclass
+class Hit:
+    query: str
+    mode: str
+    root: Optional[str]
+    root_alias: str
+    path: str
+    display_path: str
+    line: int
+    text: str
+    id: str = ""
+
+
+def compact_space(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def read_message(args_message: List[str]) -> str:
+    if args_message:
+        return compact_space(" ".join(args_message))
+    if not sys.stdin.isatty():
+        return compact_space(sys.stdin.read())
+    return ""
+
+
+def candidate_mode(query: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", query):
+        return "word"
+    return "search"
+
+
+def candidate_base_score(query: str) -> int:
+    score = 0
+    if len(query) >= 4:
+        score += 1
+    if " " in query:
+        score += 2
+    if "/" in query or query.startswith("~"):
+        score += 4
+    if re.search(r"\.[A-Za-z0-9]{1,8}\b", query):
+        score += 3
+    if re.search(r"[-_]", query):
+        score += 3
+    if re.search(r"[A-Z]", query) and re.search(r"[a-z]", query):
+        score += 3
+    if re.search(r"\d", query):
+        score += 1
+    if query.lower() in STOPWORDS:
+        score -= 10
+    if re.fullmatch(r"[a-z]+", query) and len(query) < 6:
+        score -= 4
+    return score
+
+
+def add_candidate(candidates: List[Candidate], seen: set, raw_query: str, source: str, bonus: int) -> None:
+    query = compact_space(raw_query.strip(" \\t\r\n'\".,:;!?()[]{}"))
+    if len(query) < 3:
+        return
+    key = query.casefold()
+    if key in seen:
+        return
+    mode = candidate_mode(query)
+    score = candidate_base_score(query) + bonus
+    if score < 5:
+        return
+    if mode == "word" and query.islower() and query.isalpha() and source == "identifier":
+        return
+    candidates.append(Candidate(query=query, mode=mode, source=source, score=score))
+    seen.add(key)
+
+
+def phrase_candidates_from_hints(message: str) -> List[str]:
+    words = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-z][A-Za-z0-9_-]*", message)]
+    phrases = []
+    seen = set()
+
+    def add_phrase(raw_phrase: str) -> None:
+        phrase = compact_space(raw_phrase)
+        if " " not in phrase:
+            return
+        key = phrase.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        phrases.append(phrase)
+
+    for index, (word, _, _) in enumerate(words):
+        lower = word.lower()
+        if lower not in TECH_HINTS:
+            continue
+
+        preposition_index = None
+        for cursor in range(index - 1, -1, -1):
+            token = words[cursor][0].lower()
+            if token in PREPOSITION_HINTS:
+                preposition_index = cursor
+                break
+            if token not in STOPWORDS:
+                break
+        if preposition_index is not None:
+            prior_tokens = []
+            for cursor in range(preposition_index - 1, -1, -1):
+                token = words[cursor][0]
+                if token.lower() in STOPWORDS:
+                    if prior_tokens:
+                        break
+                    continue
+                prior_tokens.append(token)
+                if len(prior_tokens) >= 2:
+                    break
+            if len(prior_tokens) >= 2:
+                add_phrase(" ".join(reversed(prior_tokens)))
+
+        tokens = [word]
+        if index > 0:
+            prev = words[index - 1][0]
+            if prev.lower() not in STOPWORDS:
+                tokens.insert(0, prev)
+        if index + 1 < len(words):
+            nxt = words[index + 1][0]
+            if nxt.lower() not in STOPWORDS:
+                tokens.append(nxt)
+        add_phrase(" ".join(tokens[:3]))
+    return phrases
+
+
+def extract_candidates(message: str) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    seen = set()
+
+    for match in re.finditer(r"`([^`\n]{2,120})`", message):
+        add_candidate(candidates, seen, match.group(1), "backtick", 7)
+    for match in re.finditer(r'"([^"\n]{2,120})"', message):
+        add_candidate(candidates, seen, match.group(1), "quote", 6)
+    for match in PATH_OR_FILE_RE.finditer(message):
+        add_candidate(candidates, seen, match.group(0), "path", 6)
+    for match in FLAG_RE.finditer(message):
+        add_candidate(candidates, seen, match.group(0), "flag", 5)
+    for match in COMPOUND_RE.finditer(message):
+        add_candidate(candidates, seen, match.group(0), "identifier", 4)
+    for match in CAMEL_RE.finditer(message):
+        add_candidate(candidates, seen, match.group(0), "identifier", 4)
+    for phrase in phrase_candidates_from_hints(message):
+        add_candidate(candidates, seen, phrase, "phrase", 3)
+
+    if not candidates:
+        tokens = [token for token in WORD_RE.findall(message) if token.lower() not in STOPWORDS]
+        for token in tokens[:2]:
+            add_candidate(candidates, seen, token, "fallback", 2)
+
+    candidates.sort(key=lambda item: (-item.score, item.mode != "search", len(item.query), item.query.casefold()))
+    return candidates
+
+
+def select_candidates(candidates: List[Candidate], max_queries: int) -> List[Candidate]:
+    selected: List[Candidate] = []
+    seen_modes = set()
+    for candidate in candidates:
+        if len(selected) >= max_queries:
+            break
+        if candidate.mode in seen_modes and len(selected) + 1 < max_queries:
+            continue
+        selected.append(candidate)
+        seen_modes.add(candidate.mode)
+    if not selected:
+        return []
+    if len(selected) < max_queries:
+        for candidate in candidates:
+            if len(selected) >= max_queries:
+                break
+            if candidate in selected:
+                continue
+            selected.append(candidate)
+    return selected[:max_queries]
+
+
+def run_machine_query(cli: str, mode: str, query: str, limit: int) -> Tuple[int, str, str]:
+    # `mode` is constrained to "search"/"word" by candidate_mode(); `limit` is
+    # always an int; `query` is untrusted user input but subprocess.run is
+    # invoked with a list and no shell, so no shell injection is possible.
+    command = [cli, "machine", mode, query, str(limit)]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)  # nosec B603 — list form, no shell
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def known_root_alias(root: Optional[str]) -> str:
+    if not root:
+        return "ROOT"
+    if root in PATH_ROOTS:
+        return PATH_ROOTS[root]
+    name = os.path.basename(root.rstrip(os.sep)) or root.rstrip(os.sep)
+    name = name.lstrip(".") or "ROOT"
+    return name[:12]
+
+
+def display_path(path: str, root: Optional[str]) -> str:
+    if root:
+        try:
+            rel = os.path.relpath(path, root)
+            if not rel.startswith(".."):
+                return f"{known_root_alias(root)}/{rel}"
+        except ValueError:
+            pass
+    for prefix, alias in PATH_ROOTS.items():
+        if path.startswith(prefix + os.sep):
+            return f"{alias}/{os.path.relpath(path, prefix)}"
+    return path
+
+
+def line_from_file(path: str, line_number: int) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for current, line in enumerate(handle, start=1):
+                if current == line_number:
+                    return compact_space(line)
+    except OSError:
+        return ""
+    return ""
+
+
+def shorten(text: str, limit: int = 110) -> str:
+    text = compact_space(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def parse_machine_output(query: str, mode: str, output: str) -> List[Hit]:
+    hits: List[Hit] = []
+    root = None
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        if line.startswith("==> ") and line.endswith(" <=="):
+            root = line[4:-4]
+            continue
+        if line.startswith("no machine "):
+            continue
+        if mode == "search":
+            match = SEARCH_LINE_RE.match(line)
+            if not match:
+                continue
+            path, line_number, text = match.groups()
+            hits.append(Hit(
+                query=query,
+                mode=mode,
+                root=root,
+                root_alias=known_root_alias(root),
+                path=path,
+                display_path=display_path(path, root),
+                line=int(line_number),
+                text=shorten(text),
+            ))
+        else:
+            match = WORD_LINE_RE.match(line)
+            if not match:
+                continue
+            path, line_number = match.groups()
+            line_int = int(line_number)
+            hits.append(Hit(
+                query=query,
+                mode=mode,
+                root=root,
+                root_alias=known_root_alias(root),
+                path=path,
+                display_path=display_path(path, root),
+                line=line_int,
+                text=shorten(line_from_file(path, line_int)),
+            ))
+    return hits
+
+
+def hit_rank(hit: Hit, candidate: Candidate, cwd_real: Optional[str] = None) -> Tuple[int, int, str, int]:
+    path_lower = hit.path.lower()
+    ext = os.path.splitext(path_lower)[1]
+    score = 0
+    if ext in CODE_EXTENSIONS:
+        score += 5
+    if ext in DOC_EXTENSIONS:
+        score -= 2
+    if "/docs/" in path_lower or path_lower.endswith("/readme.md") or path_lower.endswith("/changelog.md"):
+        score -= 2
+    if "/tests/" in path_lower or "/test/" in path_lower or path_lower.endswith("_test.go") or path_lower.endswith(".test.ts"):
+        score -= 1
+    text_lower = hit.text.lower()
+    if candidate.mode == "word" and DEFINITION_RE.search(text_lower):
+        score += 4
+    if candidate.query.casefold() in os.path.basename(path_lower):
+        score += 2
+    if candidate.mode == "search" and candidate.query.casefold() in text_lower:
+        score += 1
+    if candidate.source in {"backtick", "path"} and candidate.query.casefold() in path_lower:
+        score += 1
+    if cwd_real:
+        try:
+            hit_real = os.path.realpath(hit.path)
+        except OSError:
+            hit_real = hit.path
+        if hit_real == cwd_real or hit_real.startswith(cwd_real + os.sep):
+            score += 9
+    return (-score, len(hit.display_path), hit.display_path, hit.line)
+
+
+def render_text_block(queries: List[Candidate], hits: List[Hit]) -> str:
+    lines = ["[fast-local-context]"]
+    lines.append("queries: " + ", ".join(f"{item.mode}:{item.query}" for item in queries))
+    for hit in hits:
+        marker = f"({hit.id}) " if hit.id else ""
+        detail = f"{marker}{hit.display_path}:{hit.line}"
+        if hit.text:
+            detail += f" — {hit.text}"
+        lines.append(f"- {detail}")
+    if hits:
+        lines.append("expand: codedb-turn-context expand <id>")
+    lines.append("[/fast-local-context]")
+    return "\n".join(lines)
+
+
+def build_response(message: str, selected: List[Candidate], hits: List[Hit], reason: Optional[str], elapsed_ms: float) -> dict:
+    status = "ok" if hits and reason is None else "skip"
+    payload = {
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "queries": [asdict(item) for item in selected],
+        "hits": [asdict(hit) for hit in hits],
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+    payload["text_block"] = render_text_block(selected, hits) if status == "ok" else ""
+    return payload
+
+
+def cwd_cache_path(cwd: str) -> str:
+    # SHA1 here is content-addressing a cache filename, not a security use.
+    # `usedforsecurity=False` tells Python (and FIPS-hardened environments)
+    # that this is a non-cryptographic fingerprint — 12 hex chars is plenty
+    # to avoid collisions between parallel agents in different repos.
+    digest = hashlib.sha1(  # nosec B324 — non-crypto filename hash
+        os.path.realpath(cwd).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, f"last-{digest}.json")
+
+
+def write_hit_cache(cwd: str, message: str, hits: List[Hit]) -> None:
+    if not hits:
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = cwd_cache_path(cwd)
+        payload = {
+            "cwd": os.path.realpath(cwd),
+            "timestamp": time.time(),
+            "message": message,
+            "hits": [asdict(h) for h in hits],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def read_hit_cache(cwd: str) -> Optional[dict]:
+    path = cwd_cache_path(cwd)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def resolve_expand_target(token: str, cwd: str) -> Optional[Tuple[str, int, str]]:
+    """Resolve `h1` (cache lookup) or `path:line` (stateless) → (path, line, label)."""
+    if re.fullmatch(r"h\d+", token):
+        cache = read_hit_cache(cwd)
+        if not cache:
+            return None
+        for hit in cache.get("hits", []):
+            if hit.get("id") == token:
+                return (hit["path"], int(hit["line"]), hit.get("display_path") or hit["path"])
+        return None
+    match = re.match(r"^(.+):(\d+)$", token)
+    if match:
+        path = os.path.expanduser(match.group(1))
+        if not os.path.isabs(path):
+            path = os.path.abspath(os.path.join(cwd, path))
+        return (path, int(match.group(2)), path)
+    return None
+
+
+def render_expand(path: str, line: int, label: str, context: int) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.read().splitlines()
+    except OSError as exc:
+        return f"error: cannot read {path}: {exc}"
+    if not all_lines:
+        return f"error: empty file {path}"
+    if line < 1 or line > len(all_lines):
+        return f"error: line {line} out of range (file has {len(all_lines)} lines)"
+    start = max(1, line - context)
+    end = min(len(all_lines), line + context)
+    width = len(str(end))
+    out = [f"{label}:{line}"]
+    for i in range(start, end + 1):
+        marker = ">" if i == line else " "
+        out.append(f"  {marker} {str(i).rjust(width)} │ {all_lines[i - 1]}")
+    return "\n".join(out)
+
+
+def cmd_expand(token: str, context: int, cwd: str) -> int:
+    target = resolve_expand_target(token, cwd)
+    if not target:
+        if re.fullmatch(r"h\d+", token):
+            print(f"error: id {token} not in cache for cwd {cwd}", file=sys.stderr)
+        else:
+            print(f"error: cannot parse {token!r} as id or path:line", file=sys.stderr)
+        return 1
+    path, line, label = target
+    print(render_expand(path, line, label, context))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Compact machine-wide context prefetch for agent turns")
+    parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    parser.add_argument("--max-queries", type=int, default=2, help="maximum queries to run")
+    parser.add_argument("--max-hits", type=int, default=4, help="maximum hits to return")
+    parser.add_argument("--cwd", default=None, help="working directory used for ranking and expand cache (defaults to $PWD)")
+    parser.add_argument("--context", type=int, default=10, help="lines of context for expand subcommand")
+    parser.add_argument("--config", default=None, help="explicit path to per-user TOML config (default: $CODEDB_TURN_CONTEXT_CONFIG, then ~/.config/codedb-turn-context.toml)")
+    parser.add_argument("message", nargs="*", help="user message (reads stdin if omitted) or 'expand <id|path:line>'")
+    args = parser.parse_args()
+
+    # Load per-user path aliases from TOML config (empty if no config found).
+    # PATH_ROOTS is a module-level dict consulted by display_path() and
+    # known_root_alias(); mutating it here keeps those call sites simple.
+    global PATH_ROOTS
+    PATH_ROOTS = load_path_aliases(args.config)
+
+    cwd = args.cwd or os.environ.get("PWD") or os.getcwd()
+    try:
+        cwd_real = os.path.realpath(cwd)
+    except OSError:
+        cwd_real = None
+
+    if args.message and args.message[0] == "expand":
+        if len(args.message) < 2:
+            print("usage: codedb-turn-context expand <id|path:line>", file=sys.stderr)
+            return 2
+        return cmd_expand(args.message[1], max(0, args.context), cwd)
+
+    started = time.perf_counter()
+    message = read_message(args.message)
+    if not message:
+        payload = build_response(message, [], [], "empty_message", (time.perf_counter() - started) * 1000)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    candidates = extract_candidates(message)
+    selected = select_candidates(candidates, max(1, args.max_queries))
+    if not selected:
+        payload = build_response(message, [], [], "no_candidates", (time.perf_counter() - started) * 1000)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    cli = os.environ.get("CODEDB_CONTEXT_CLI", "codedb-cli")
+    seen = set()
+    all_hits: List[Hit] = []
+    any_error = False
+    per_query_limit = max(1, args.max_hits)
+
+    for candidate in selected:
+        returncode, stdout, _stderr = run_machine_query(cli, candidate.mode, candidate.query, per_query_limit * 10)
+        if returncode != 0:
+            any_error = True
+            continue
+        ranked_hits = sorted(parse_machine_output(candidate.query, candidate.mode, stdout), key=lambda hit: hit_rank(hit, candidate, cwd_real))
+        for hit in ranked_hits:
+            key = (hit.path, hit.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_hits.append(hit)
+            if len(all_hits) >= args.max_hits:
+                break
+        if len(all_hits) >= args.max_hits:
+            break
+
+    for index, hit in enumerate(all_hits, start=1):
+        hit.id = f"h{index}"
+
+    if all_hits:
+        write_hit_cache(cwd, message, all_hits)
+
+    reason = None
+    if not all_hits:
+        reason = "query_error" if any_error else "no_hits"
+
+    payload = build_response(message, selected, all_hits, reason, (time.perf_counter() - started) * 1000)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload["status"] == "ok":
+        print(payload["text_block"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
