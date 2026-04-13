@@ -251,11 +251,14 @@ fn mainImpl() !void {
                     };
                 }
             } else {
-                // Cold run: shrink word index first, then build trigrams in a
-                // page_allocator-backed TrigramIndex. This prevents the trigram
-                // index's peak from stacking on top of word index capacity waste.
+                // Cold run: persist word index → free → build trigrams → reload.
+                // This prevents word index + trigram index from coexisting in memory.
                 explorer.releaseContents();
-                explorer.word_index.shrinkAllocations();
+                persistWordIndexToDisk(&explorer, data_dir, git_head);
+                explorer.mu.lock();
+                explorer.word_index.deinit();
+                explorer.word_index = WordIndex.init(allocator);
+                explorer.mu.unlock();
                 {
                     // Build trigrams into a temporary index backed by page_allocator.
                     // When the arena is freed, ALL trigram pages go back to OS.
@@ -285,13 +288,15 @@ fn mainImpl() !void {
                     // Free temp trigram — arena.deinit returns all pages to OS
                     tri_arena.deinit();
                 }
-                // Load as mmap (zero heap cost)
+                // Load trigrams as mmap (zero heap cost)
                 if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
                     explorer.mu.lock();
                     explorer.trigram_index.deinit();
                     explorer.trigram_index = .{ .mmap = loaded };
                     explorer.mu.unlock();
                 }
+                // Reload word index from disk
+                loadWordIndexFromDiskIfPresent(&explorer, data_dir, git_head, allocator);
             }
 
             // If no freq table was loaded, build one from indexed content and
