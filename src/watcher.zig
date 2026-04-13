@@ -473,7 +473,7 @@ pub fn initialScan(store: *Store, explorer: *Explorer, root: []const u8, allocat
             if (parsed > 0) break :blk parsed;
         } else |_| {}
         const cpu_count = std.Thread.getCpuCount() catch 1;
-        break :blk @min(@as(usize, @intCast(cpu_count)), 4);
+        break :blk @min(@as(usize, @intCast(cpu_count)), 8);
     };
     try initialScanWithWorkerCount(store, explorer, root, allocator, skip_trigram, worker_count);
 }

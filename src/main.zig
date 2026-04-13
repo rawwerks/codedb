@@ -269,16 +269,24 @@ fn mainImpl() !void {
                 explorer.word_index = WordIndex.init(allocator);
                 explorer.mu.unlock();
                 {
-                    // Build trigrams with c_allocator — freed pages returned to OS
-                    // on HashMap resize (unlike ArenaAllocator which retains all).
+                    // Build trigrams — read files from disk, index one at a time.
+                    // Uses c_allocator so freed pages return to OS on resize.
                     var tmp_tri = TrigramIndex.init(std.heap.c_allocator);
+
+                    // Collect outline paths for parallel access
+                    var paths: std.ArrayList([]const u8) = .{};
+                    defer paths.deinit(allocator);
+                    {
+                        var key_iter = explorer.outlines.keyIterator();
+                        while (key_iter.next()) |k| {
+                            paths.append(allocator, k.*) catch {};
+                        }
+                    }
 
                     var tri_dir = std.fs.cwd().openDir(root, .{}) catch null;
                     defer if (tri_dir) |*d| d.close();
                     if (tri_dir) |dir| {
-                        var key_iter = explorer.outlines.keyIterator();
-                        while (key_iter.next()) |path_ptr| {
-                            const p = path_ptr.*;
+                        for (paths.items) |p| {
                             const f = dir.openFile(p, .{}) catch continue;
                             defer f.close();
                             var fa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -289,11 +297,10 @@ fn mainImpl() !void {
                             }
                         }
                     }
-                    // Write temp trigram index to disk
+                    // Write + free
                     tmp_tri.writeToDisk(data_dir, git_head) catch |err| {
                         std.log.warn("could not persist trigram index: {}", .{err});
                     };
-                    // Free temp trigram — c_allocator returns pages to OS
                     tmp_tri.deinit();
                 }
                 // Load trigrams as mmap (zero heap cost)
