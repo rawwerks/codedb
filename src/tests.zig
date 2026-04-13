@@ -1048,7 +1048,7 @@ test "explorer: removeFile frees owned map key" {
     }
 
     try testing.expect(explorer.outlines.count() == 0);
-    try testing.expect(explorer.contents.count() == 0);
+    try testing.expect(explorer.contents.count == 0);
     try testing.expect(explorer.dep_graph.count() == 0);
 }
 test "watcher: queue overflow is explicit" {
@@ -3808,7 +3808,7 @@ test "issue-105: large files skip trigram indexing to prevent OOM" {
 
     // The file should be in outlines and contents but NOT in the trigram index
     try testing.expect(explorer.outlines.count() == 1);
-    try testing.expect(explorer.contents.count() == 1);
+    try testing.expect(explorer.contents.count == 1);
     try testing.expect(explorer.trigram_index.fileCount() == 0);
 
     // A small file should still get trigram-indexed
@@ -6092,3 +6092,75 @@ test "issue-179: Python multi-line docstring with def inside" {
     try testing.expectEqual(@as(usize, 0), inner.len);
 }
 
+test "issue-208: ContentCache basic put/get/remove" {
+    const ContentCache = explore.ContentCache;
+    var cache = ContentCache.init(testing.allocator);
+    defer cache.deinit();
+
+    const data = try testing.allocator.dupe(u8, "hello world");
+    cache.put("test.zig", data);
+
+    const got = cache.get("test.zig");
+    try testing.expect(got != null);
+    try testing.expect(std.mem.eql(u8, got.?, "hello world"));
+    try testing.expectEqual(@as(u32, 1), cache.count);
+
+    cache.remove("test.zig");
+    try testing.expect(cache.get("test.zig") == null);
+    try testing.expectEqual(@as(u32, 0), cache.count);
+}
+
+test "issue-208: ContentCache update existing entry" {
+    const ContentCache = explore.ContentCache;
+    var cache = ContentCache.init(testing.allocator);
+    defer cache.deinit();
+
+    const data1 = try testing.allocator.dupe(u8, "version 1");
+    cache.put("file.zig", data1);
+
+    const data2 = try testing.allocator.dupe(u8, "version 2");
+    cache.put("file.zig", data2);
+
+    try testing.expectEqual(@as(u32, 1), cache.count);
+    const got = cache.get("file.zig");
+    try testing.expect(got != null);
+    try testing.expect(std.mem.eql(u8, got.?, "version 2"));
+}
+
+test "issue-208: ContentCache clear resets state" {
+    const ContentCache = explore.ContentCache;
+    var cache = ContentCache.init(testing.allocator);
+    defer cache.deinit();
+
+    const d1 = try testing.allocator.dupe(u8, "a");
+    cache.put("a.zig", d1);
+    const d2 = try testing.allocator.dupe(u8, "b");
+    cache.put("b.zig", d2);
+    try testing.expectEqual(@as(u32, 2), cache.count);
+
+    cache.clear();
+    try testing.expectEqual(@as(u32, 0), cache.count);
+    try testing.expect(cache.get("a.zig") == null);
+    try testing.expect(cache.get("b.zig") == null);
+}
+
+test "issue-208: ContentCache evicts under pressure" {
+    const ContentCache = explore.ContentCache;
+    var cache = ContentCache.init(testing.allocator);
+    defer cache.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const total = ContentCache.MAX_ENTRIES + 500;
+    var i: u32 = 0;
+    while (i < total) : (i += 1) {
+        const path = try std.fmt.allocPrint(arena.allocator(), "file_{d}.zig", .{i});
+        const data = try testing.allocator.dupe(u8, "x");
+        cache.put(path, data);
+    }
+
+    try testing.expect(cache.count <= ContentCache.MAX_ENTRIES);
+    const recent_path = try std.fmt.allocPrint(arena.allocator(), "file_{d}.zig", .{total - 1});
+    try testing.expect(cache.get(recent_path) != null);
+}

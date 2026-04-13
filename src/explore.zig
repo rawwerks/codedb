@@ -130,10 +130,121 @@ pub const SearchResult = struct {
     line_text: []const u8,
 };
 
+pub const ContentCache = struct {
+    pub const MAX_ENTRIES: u32 = 4096;
+
+    const Entry = struct {
+        path: []const u8 = "",
+        data: []const u8 = "",
+        ref_bit: bool = false,
+        occupied: bool = false,
+    };
+
+    slots: []Entry,
+    lookup: std.StringHashMap(u32),
+    hand: u32 = 0,
+    count: u32 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) ContentCache {
+        const slots = allocator.alloc(Entry, MAX_ENTRIES) catch @panic("ContentCache: OOM on init");
+        @memset(slots, Entry{});
+        return .{
+            .slots = slots,
+            .lookup = std.StringHashMap(u32).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ContentCache) void {
+        for (self.slots) |*slot| {
+            if (slot.occupied) {
+                self.allocator.free(slot.data);
+            }
+        }
+        self.allocator.free(self.slots);
+        self.lookup.deinit();
+    }
+
+    pub fn get(self: *ContentCache, path: []const u8) ?[]const u8 {
+        const si = self.lookup.get(path) orelse return null;
+        self.slots[si].ref_bit = true;
+        return self.slots[si].data;
+    }
+
+    pub fn put(self: *ContentCache, path: []const u8, data: []const u8) void {
+        if (self.lookup.get(path)) |si| {
+            self.allocator.free(self.slots[si].data);
+            self.slots[si].data = data;
+            self.slots[si].ref_bit = true;
+            return;
+        }
+
+        const slot_idx = self.findSlot();
+        const slot = &self.slots[slot_idx];
+
+        if (slot.occupied) {
+            _ = self.lookup.remove(slot.path);
+            self.allocator.free(slot.data);
+        } else {
+            self.count += 1;
+        }
+
+        slot.* = .{
+            .path = path,
+            .data = data,
+            .ref_bit = true,
+            .occupied = true,
+        };
+        self.lookup.put(path, slot_idx) catch {};
+    }
+
+    pub fn remove(self: *ContentCache, path: []const u8) void {
+        const si = self.lookup.get(path) orelse return;
+        _ = self.lookup.remove(path);
+        self.allocator.free(self.slots[si].data);
+        self.slots[si] = Entry{};
+        self.count -= 1;
+    }
+
+    pub fn clear(self: *ContentCache) void {
+        for (self.slots) |*slot| {
+            if (slot.occupied) {
+                self.allocator.free(slot.data);
+                slot.* = Entry{};
+            }
+        }
+        self.lookup.clearAndFree();
+        self.count = 0;
+        self.hand = 0;
+    }
+
+    fn findSlot(self: *ContentCache) u32 {
+        if (self.count < MAX_ENTRIES) {
+            for (self.slots, 0..) |*slot, i| {
+                if (!slot.occupied) return @intCast(i);
+            }
+        }
+
+        var probes: u32 = 0;
+        while (probes < MAX_ENTRIES * 2) : (probes += 1) {
+            const slot = &self.slots[self.hand];
+            const si = self.hand;
+            self.hand = (self.hand + 1) % MAX_ENTRIES;
+            if (!slot.occupied) return si;
+            if (!slot.ref_bit) return si;
+            slot.ref_bit = false;
+        }
+        const si = self.hand;
+        self.hand = (self.hand + 1) % MAX_ENTRIES;
+        return si;
+    }
+};
+
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: std.StringHashMap(std.ArrayList([]const u8)),
-    contents: std.StringHashMap([]const u8),
+    contents: ContentCache,
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
     sparse_ngram_index: SparseNgramIndex,
@@ -155,7 +266,7 @@ pub const Explorer = struct {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
-            .contents = std.StringHashMap([]const u8).init(allocator),
+            .contents = ContentCache.init(allocator),
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .sparse_ngram_index = SparseNgramIndex.init(allocator),
@@ -178,10 +289,6 @@ pub const Explorer = struct {
         }
         self.dep_graph.deinit();
 
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.contents.deinit();
 
         self.word_index.deinit();
@@ -209,11 +316,7 @@ pub const Explorer = struct {
     pub fn releaseContents(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.contents.clearAndFree();
+        self.contents.clear();
     }
 
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
@@ -272,22 +375,17 @@ pub const Explorer = struct {
         persistent_outline.path = stable_path;
 
         const duped_content = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(duped_content);
-        const content_gop = try self.contents.getOrPut(stable_path);
-        var prior_content: ?[]const u8 = null;
-        if (content_gop.found_existing) {
-            prior_content = content_gop.value_ptr.*;
-        } else {
-            content_gop.key_ptr.* = stable_path;
-        }
-        content_gop.value_ptr.* = duped_content;
-        errdefer {
-            if (content_gop.found_existing) {
-                content_gop.value_ptr.* = prior_content.?;
-            } else {
-                _ = self.contents.remove(stable_path);
-            }
-        }
+        // Save prior content before cache.put frees it — needed for word_index
+        // errdefer restoration (#252: OOM during trigram indexing must not leave
+        // word_index and trigram_index diverged).
+        const prior_content: ?[]const u8 = if (self.contents.get(stable_path)) |old|
+            self.allocator.dupe(u8, old) catch null
+        else
+            null;
+        defer if (prior_content) |pc| self.allocator.free(pc);
+
+        self.contents.put(stable_path, duped_content);
+        errdefer self.contents.remove(stable_path);
 
         if (full_index) {
             if (!self.word_index_complete) {
@@ -318,7 +416,6 @@ pub const Explorer = struct {
         try self.rebuildDepsFor(stable_path, &persistent_outline);
 
         outline_gop.value_ptr.* = persistent_outline;
-        if (prior_content) |old_content| self.allocator.free(old_content);
         if (prior_outline) |*old_outline| old_outline.deinit();
     }
 
@@ -652,17 +749,16 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
     pub fn rebuildTrigrams(self: *Explorer) !void {
         self.mu.lock();
         defer self.mu.unlock();
-        var iter = self.contents.iterator();
-        while (iter.next()) |entry| {
-            // Skip large files to prevent OOM on large repos
-            if (entry.value_ptr.len > 64 * 1024) continue;
-            self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
+        for (self.contents.slots) |*slot| {
+            if (!slot.occupied) continue;
+            if (slot.data.len > 64 * 1024) continue;
+            self.trigram_index.indexFile(slot.path, slot.data) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("trigram OOM, skipping remaining files", .{});
                     return;
                 },
             };
-            self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
+            self.sparse_ngram_index.indexFile(slot.path, slot.data) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("sparse ngram OOM, skipping remaining files", .{});
                     return;
@@ -680,9 +776,9 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         self.word_index.deinit();
         self.word_index = WordIndex.init(self.allocator);
 
-        var iter = self.contents.iterator();
-        while (iter.next()) |entry| {
-            try self.word_index.indexFile(entry.key_ptr.*, entry.value_ptr.*);
+        for (self.contents.slots) |*slot| {
+            if (!slot.occupied) continue;
+            try self.word_index.indexFile(slot.path, slot.data);
         }
         self.word_index_generation +%= 1;
         self.word_index_complete = true;
@@ -763,10 +859,7 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
             deps.deinit(self.allocator);
             _ = self.dep_graph.remove(path);
         }
-        if (self.contents.getPtr(path)) |content| {
-            self.allocator.free(content.*);
-            _ = self.contents.remove(path);
-        }
+        self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
         self.sparse_ngram_index.removeFile(path);
@@ -1117,7 +1210,7 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
     /// Search for a word using the inverted word index. O(1) lookup.
     pub fn searchWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
         self.mu.lockShared();
-        const needs_rebuild = !self.word_index_complete and self.contents.count() > 0;
+        const needs_rebuild = !self.word_index_complete and self.contents.count > 0;
         self.mu.unlockShared();
         if (needs_rebuild) {
             try self.rebuildWordIndex();

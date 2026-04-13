@@ -259,8 +259,8 @@ fn mainImpl() !void {
             // If no freq table was loaded, build one from indexed content and
             // persist for next run.  Streams file-by-file — zero extra memory.
             if (freq_table_heap == null) {
-                if (explorer.contents.count() > 0) {
-                    const ft = index_mod.buildFrequencyTableFromMap(&explorer.contents);
+                if (explorer.contents.count > 0) {
+                    const ft = index_mod.buildFrequencyTableFromCache(&explorer.contents);
                     index_mod.writeFrequencyTable(&ft, data_dir) catch |err| {
                         std.log.warn("could not persist frequency table: {}", .{err});
                     };

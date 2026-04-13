@@ -2209,6 +2209,19 @@ pub fn buildFrequencyTableFromMap(contents: *const std.StringHashMap([]const u8)
     return finishFrequencyTable(&counts);
 }
 
+pub fn buildFrequencyTableFromCache(cache: *const @import("explore.zig").ContentCache) [256][256]u16 {
+    var counts: [256][256]u64 = .{.{0} ** 256} ** 256;
+    for (cache.slots) |*slot| {
+        if (!slot.occupied) continue;
+        const content = slot.data;
+        if (content.len < 2) continue;
+        for (0..content.len - 1) |i| {
+            counts[content[i]][content[i + 1]] += 1;
+        }
+    }
+    return finishFrequencyTable(&counts);
+}
+
 fn finishFrequencyTable(counts: *const [256][256]u64) [256][256]u16 {
     var max_count: u64 = 1;
     for (counts) |row| {
