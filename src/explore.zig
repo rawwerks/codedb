@@ -529,13 +529,21 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
         var trimmed = std.mem.trim(u8, line, " \t");
 
         if (outline.language == .python) {
-            const triple_count = std.mem.count(u8, trimmed, "\"\"\"") + std.mem.count(u8, trimmed, "'''");
+            const has_dq = std.mem.indexOf(u8, trimmed, "\"\"\"");
+            const has_sq = std.mem.indexOf(u8, trimmed, "'''");
+            const has_triple = has_dq != null or has_sq != null;
             if (in_py_docstring) {
-                if (triple_count > 0) in_py_docstring = false;
+                if (has_triple) in_py_docstring = false;
                 continue;
             }
-            if (triple_count >= 2) continue;
-            if (triple_count == 1) {
+            if (has_triple) {
+                // Check if triple quote appears twice (single-line docstring like """text""")
+                const marker = if (has_dq != null) "\"\"\"" else "'''";
+                const first_pos = if (has_dq) |p| p else has_sq.?;
+                if (std.mem.indexOf(u8, trimmed[first_pos + 3 ..], marker) != null) {
+                    // Opens and closes on same line — skip as a single-line docstring
+                    continue;
+                }
                 in_py_docstring = true;
                 continue;
             }

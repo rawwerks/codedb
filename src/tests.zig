@@ -6045,3 +6045,50 @@ test "issue-215: detectLanguage handles .r and .R" {
     try testing.expectEqual(Language.r, explore.detectLanguage("script.r"));
     try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
 }
+
+test "issue-179: Python inline docstring does not leak symbols" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("mod.py",
+        \\def real_func():
+        \\    """This docstring contains def fake(): pass"""
+        \\    return 1
+    );
+
+    const real = try explorer.findAllSymbols("real_func", alloc);
+    defer alloc.free(real);
+    try testing.expect(real.len == 1);
+
+    const fake = try explorer.findAllSymbols("fake", alloc);
+    defer alloc.free(fake);
+    try testing.expectEqual(@as(usize, 0), fake.len);
+}
+
+test "issue-179: Python multi-line docstring with def inside" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("doc.py",
+        \\def outer():
+        \\    """
+        \\    Example:
+        \\        def inner_example():
+        \\            pass
+        \\    """
+        \\    return True
+    );
+
+    const outer = try explorer.findAllSymbols("outer", alloc);
+    defer alloc.free(outer);
+    try testing.expect(outer.len == 1);
+
+    const inner = try explorer.findAllSymbols("inner_example", alloc);
+    defer alloc.free(inner);
+    try testing.expectEqual(@as(usize, 0), inner.len);
+}
+

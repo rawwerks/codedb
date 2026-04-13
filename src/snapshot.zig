@@ -119,10 +119,11 @@ pub fn writeSnapshot(
             if (!first) try writer.writeByte(',');
             first = false;
             const outline = entry.value_ptr;
+            try writer.writeAll("{\"path\":\"");
+            try writeJsonEscaped(writer, entry.key_ptr.*);
             try writer.print(
-                \\{{"path":"{s}","language":"{s}","line_count":{d},"byte_size":{d},"symbol_count":{d}}}
+                \\","language":"{s}","line_count":{d},"byte_size":{d},"symbol_count":{d}}}
             , .{
-                entry.key_ptr.*,
                 @tagName(outline.language),
                 outline.line_count,
                 outline.byte_size,
@@ -973,4 +974,23 @@ pub fn writeSnapshotDual(
     } else |_| {}
 
     writeSnapshot(explorer, root_path, secondary, allocator) catch {};
+}
+
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                try writer.writeAll(&esc);
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
 }
