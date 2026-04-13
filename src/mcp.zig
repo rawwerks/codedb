@@ -1103,7 +1103,7 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
 
     explorer.mu.lockShared();
     const outline_count = explorer.outlines.count();
-    const content_count = explorer.contents.count();
+    const content_count = explorer.contents.count;
     const trigram_type: []const u8 = switch (explorer.trigram_index) {
         .heap => "heap",
         .mmap => "mmap",
