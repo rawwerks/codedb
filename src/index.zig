@@ -726,6 +726,53 @@ pub const TrigramIndex = struct {
         try self.file_trigrams.put(path, tri_list);
     }
 
+    /// Extract trigrams from content — thread-safe, no shared state.
+    pub fn extractTrigrams(content: []const u8, alloc: std.mem.Allocator) std.AutoHashMap(Trigram, PostingMask) {
+        var local = std.AutoHashMap(Trigram, PostingMask).init(alloc);
+        const estimated = @max(@as(u32, 64), @as(u32, @intCast(@min(content.len / 4, 65536))));
+        local.ensureTotalCapacity(estimated) catch {};
+        if (content.len >= 3) {
+            for (0..content.len - 2) |i| {
+                const c0 = content[i];
+                const c1 = content[i + 1];
+                const c2 = content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = packTrigram(normalizeChar(c0), normalizeChar(c1), normalizeChar(c2));
+                const gop = local.getOrPut(tri) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                }
+            }
+        }
+        return local;
+    }
+
+    /// Insert pre-extracted trigrams. NOT thread-safe.
+    pub fn insertExtracted(self: *TrigramIndex, path: []const u8, local: *std.AutoHashMap(Trigram, PostingMask)) !void {
+        self.removeFile(path);
+        const doc_id = try self.getOrCreateDocId(path);
+        var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
+        var iter = local.iterator();
+        while (iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            try idx_gop.value_ptr.items.append(self.allocator, .{
+                .doc_id = doc_id, .next_mask = mask.next_mask, .loc_mask = mask.loc_mask,
+            });
+            try tri_list.append(self.allocator, tri);
+        }
+        try self.file_trigrams.put(path, tri_list);
+    }
+
     /// Find candidate files that contain ALL trigrams from the query.
     pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
         if (query.len < 3) return null;
