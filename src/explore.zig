@@ -1290,8 +1290,6 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         errdefer result_list.deinit(allocator);
 
         // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
-        // Only use when hit count is small; large hit lists (e.g. "fn" → 924 hits)
-        // are slower to iterate than trigram candidate scanning.
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
             for (word_hits) |hit| {
@@ -1299,8 +1297,6 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
                 if (hit_path.len == 0) continue;
                 const cached = self.contents.get(hit_path) orelse continue;
                 const line_text = extractLineByNumber(cached, hit.line_num) orelse continue;
-                // Verify the line actually contains the query (word index is whole-word,
-                // but searchContent is substring — confirm before returning).
                 if (indexOfCaseInsensitive(line_text, query) == null) continue;
                 const duped_text = try allocator.dupe(u8, line_text);
                 errdefer allocator.free(duped_text);
@@ -1313,7 +1309,6 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
                 });
                 if (result_list.items.len >= max_results) return result_list.toOwnedSlice(allocator);
             }
-            // If word index found enough results, return early.
             if (result_list.items.len >= max_results)
                 return result_list.toOwnedSlice(allocator);
         }
@@ -1321,11 +1316,8 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
-        var searched = std.StringHashMap(void).init(allocator);
-        defer searched.deinit();
-
-        // Tier 1: trigram candidates — sorted by cached content size (smallest first).
-        // Smaller files scan faster and are more likely to be focused source files.
+        // Tier 1: trigram candidates — fast path without searched HashMap.
+        // If Tier 1 fills results, we skip HashMap allocation entirely.
         if (candidate_paths) |cp| {
             if (cp.len > 0) {
                 const SortCtx = struct {
@@ -1343,11 +1335,19 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
                 for (cp) |path| {
                     const ref = self.readContentForSearch(path, allocator) orelse continue;
                     defer ref.deinit();
-                    searched.put(path, {}) catch {};
                     try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
+                    if (result_list.items.len >= max_results)
+                        return result_list.toOwnedSlice(allocator);
                 }
             }
+        }
+
+        // Only allocate searched HashMap if we need tiers 2-5.
+        var searched = std.StringHashMap(void).init(allocator);
+        defer searched.deinit();
+        // Mark all Tier 1 candidates as searched.
+        if (candidate_paths) |cp| {
+            for (cp) |p| searched.put(p, {}) catch {};
         }
 
         // Tier 2: sparse candidates — LAZY, only computed when Tier 1 found nothing.
