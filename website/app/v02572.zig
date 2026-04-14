@@ -196,14 +196,15 @@ const html =
     \\    <div class="section-heading">codedb vs ripgrep vs grep</div>
     \\    <p class="section-sub" style="color:var(--muted);">Internal search for "manager" on openclaw (6,315 files). Warm trigram index vs cold disk scan. Apple M4 Pro, median of 5 runs.</p>
     \\    <table class="bench-table" style="color:var(--text);">
-    \\      <thead><tr><th>Tool</th><th>Internal search</th><th>Results</th><th>Approach</th><th>vs codedb</th></tr></thead>
+    \\    <div class="section-heading">codedb vs fff-mcp vs ripgrep vs grep</div>
     \\      <tbody>
     \\        <tr><td><strong>codedb v0.2.572</strong> (Zig)</td><td class="fast">~500 µs</td><td>20 (limited)</td><td>Warm trigram</td><td class="fast">baseline</td></tr>
     \\        <tr><td>ripgrep 15.1</td><td>~500 ms</td><td>2,959 (all)</td><td>Disk scan</td><td>1,000× slower</td></tr>
     \\        <tr><td>GNU grep</td><td>~1,500 ms</td><td>2,973 (all)</td><td>Disk scan</td><td>3,000× slower</td></tr>
-    \\      </tbody>
-    \\    </table>
-    \\    <div style="background:var(--dark3);border-radius:8px;padding:20px;margin:24px 0;border-left:3px solid var(--accent);">
+        \\        <tr><td><strong>codedb v0.2.572</strong> (Zig)</td><td class="fast">~500 µs</td><td>20 (limited)</td><td>Warm trigram</td><td class="fast">baseline</td></tr>
+        \\        <tr><td>fff-mcp 0.5.2 (Rust)</td><td class="fast">~500 µs</td><td>limited (lower recall)</td><td>Bigram + frecency</td><td>competitive — 2–6× fewer results</td></tr>
+        \\        <tr><td>ripgrep 15.1</td><td>~500 ms</td><td>2,959 (all)</td><td>Disk scan</td><td>1,000× slower</td></tr>
+        \\        <tr><td>GNU grep</td><td>~1,500 ms</td><td>2,973 (all)</td><td>Disk scan</td><td>3,000× slower</td></tr>
     \\      <h4 style="color:#fff;font-size:14px;margin-bottom:8px;">Why warm indices win</h4>
     \\      <p style="color:rgba(255,255,255,0.5);font-size:12px;font-family:var(--mono);line-height:1.6;margin:0;">
     \\        <strong>codedb</strong>: ~500 microseconds (0.5ms) for trigram index lookup.<br>
@@ -279,16 +280,14 @@ const html =
     \\  });
     \\  new Chart(document.getElementById('searchChart'), {
     \\    type: 'bar',
-    \\    data: { labels: ['codedb', 'ripgrep', 'grep'], datasets: [{ data: [0.5, 500, 1500], backgroundColor: [green, '#9ca3af', gray], borderRadius: 4, barThickness: 32 }] },
+    \\    data: { labels: ["codedb", "fff-mcp", "ripgrep", "grep"], datasets: [{ data: [0.5, 0.5, 500, 1500], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
     \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'ms (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  new Chart(document.getElementById('resultsChart'), {
     \\    type: 'bar',
-    \\    data: { labels: ['codedb (20)', 'ripgrep (2959)', 'grep (2973)'], datasets: [{ data: [20, 2959, 2973], backgroundColor: [green, '#9ca3af', gray], borderRadius: 4, barThickness: 32 }] },
+    \\    data: { labels: ["codedb (20)", "fff-mcp (fewer)", "ripgrep (2959)", "grep (2973)"], datasets: [{ data: [20, 8, 2959, 2973], backgroundColor: [green, "#3b82f6", "#9ca3af", gray], borderRadius: 4, barThickness: 32 }] },
     \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'results (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  document.getElementById('burger')?.addEventListener('click', function() { this.classList.toggle('open'); document.getElementById('nav-links').classList.toggle('open'); });
-    \\</script>
-    \\</body>
     \\</html>
 ;
