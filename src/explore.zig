@@ -2725,53 +2725,93 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
     const first_upper: u8 = if (query[0] >= 'a' and query[0] <= 'z') query[0] - 32 else query[0];
     var file_hits: usize = 0;
     var pos: usize = 0;
+    const end = content.len - query.len + 1;
 
-    // Track line number incrementally — O(1) per match instead of O(pos).
+    // Track line number incrementally.
     var current_line: u32 = 1;
     var current_line_start: usize = 0;
 
-    while (pos + query.len <= content.len) {
-        const c = content[pos];
-        if (c != first_lower and c != first_upper) {
-            pos += 1;
-            continue;
-        }
+    // SIMD constants — 16-byte NEON/SSE vectors.
+    const VW = 16;
+    const Vec = @Vector(VW, u8);
+    const splat_lo: Vec = @splat(first_lower);
+    const splat_hi: Vec = @splat(first_upper);
 
-        if (!matchAtCaseInsensitive(content, pos, query)) {
-            pos += 1;
-            continue;
-        }
+    while (pos < end) {
+        // ── SIMD path: process full 16-byte chunks ──
+        if (pos + VW <= end) {
+            const chunk: Vec = content[pos..][0..VW].*;
+            const eq_lo: @Vector(VW, u1) = @bitCast(chunk == splat_lo);
+            const eq_hi: @Vector(VW, u1) = @bitCast(chunk == splat_hi);
+            var mask: u16 = @bitCast(eq_lo | eq_hi);
 
-        // Advance line counter from current_line_start to pos.
-        // Only counts newlines in the gap since last match — O(gap) not O(pos).
-        while (current_line_start < pos) {
-            if (std.mem.indexOfScalarPos(u8, content, current_line_start, '\n')) |nl| {
-                if (nl < pos) {
+            if (mask == 0) {
+                pos += VW;
+                continue;
+            }
+
+            // Process ALL first-byte candidates in this chunk without reloading.
+            var found_match = false;
+            while (mask != 0) {
+                const offset: usize = @ctz(mask);
+                const cand = pos + offset;
+                if (cand >= end) break;
+
+                if (matchAtCaseInsensitive(content, cand, query)) {
+                    // ── Match found ──
+                    while (current_line_start < cand) {
+                        if (std.mem.indexOfScalarPos(u8, content, current_line_start, '\n')) |nl| {
+                            if (nl < cand) { current_line += 1; current_line_start = nl + 1; } else break;
+                        } else break;
+                    }
+                    const line_start = current_line_start;
+                    const line_end = if (std.mem.indexOfScalarPos(u8, content, cand, '\n')) |nl| nl else content.len;
+
+                    const line_text = try allocator.dupe(u8, content[line_start..line_end]);
+                    errdefer allocator.free(line_text);
+                    const path_copy = try allocator.dupe(u8, path);
+                    errdefer allocator.free(path_copy);
+                    try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
+                    file_hits += 1;
+                    if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+
                     current_line += 1;
-                    current_line_start = nl + 1;
-                } else break;
-            } else break;
+                    current_line_start = line_end + 1;
+                    pos = line_end + 1;
+                    found_match = true;
+                    break; // restart outer loop from new line
+                }
+                mask &= mask - 1; // clear lowest bit, try next candidate in chunk
+            }
+            if (!found_match) pos += VW; // all candidates were false positives
+            continue;
         }
 
-        const line_start = current_line_start;
-        const line_end = if (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| nl else content.len;
+        // ── Scalar tail for last <16 bytes ──
+        const c = content[pos];
+        if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query)) {
+            while (current_line_start < pos) {
+                if (std.mem.indexOfScalarPos(u8, content, current_line_start, '\n')) |nl| {
+                    if (nl < pos) { current_line += 1; current_line_start = nl + 1; } else break;
+                } else break;
+            }
+            const line_start = current_line_start;
+            const line_end = if (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| nl else content.len;
 
-        const line_text = try allocator.dupe(u8, content[line_start..line_end]);
-        errdefer allocator.free(line_text);
-        const path_copy = try allocator.dupe(u8, path);
-        errdefer allocator.free(path_copy);
-        try result_list.append(allocator, .{
-            .path = path_copy,
-            .line_num = current_line,
-            .line_text = line_text,
-        });
-        file_hits += 1;
-        if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+            const line_text = try allocator.dupe(u8, content[line_start..line_end]);
+            errdefer allocator.free(line_text);
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+            try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
+            file_hits += 1;
+            if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
 
-        // Skip to next line.
-        current_line += 1;
-        current_line_start = line_end + 1;
-        pos = line_end + 1;
+            current_line += 1;
+            current_line_start = line_end + 1;
+            pos = line_end + 1;
+            continue;
+        }
+        pos += 1;
     }
 }
 
