@@ -2720,7 +2720,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
     if (query.len == 0 or content.len == 0) return;
-
+    result_list.ensureTotalCapacity(allocator, result_list.items.len + @min(max_per_file, 16)) catch {};
     const first_lower: u8 = if (query[0] >= 'A' and query[0] <= 'Z') query[0] + 32 else query[0];
     const first_upper: u8 = if (query[0] >= 'a' and query[0] <= 'z') query[0] - 32 else query[0];
     var file_hits: usize = 0;
@@ -2760,12 +2760,12 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
                 if (matchAtCaseInsensitive(content, cand, query)) {
                     // ── Match found ──
                     while (current_line_start < cand) {
-                        if (std.mem.indexOfScalarPos(u8, content, current_line_start, '\n')) |nl| {
+                        if (simdIndexOfNewline(content, current_line_start)) |nl| {
                             if (nl < cand) { current_line += 1; current_line_start = nl + 1; } else break;
                         } else break;
                     }
                     const line_start = current_line_start;
-                    const line_end = if (std.mem.indexOfScalarPos(u8, content, cand, '\n')) |nl| nl else content.len;
+                    const line_end = simdIndexOfNewline(content, cand) orelse content.len;
 
                     const line_text = try allocator.dupe(u8, content[line_start..line_end]);
                     errdefer allocator.free(line_text);
@@ -2791,12 +2791,12 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         const c = content[pos];
         if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query)) {
             while (current_line_start < pos) {
-                if (std.mem.indexOfScalarPos(u8, content, current_line_start, '\n')) |nl| {
+                if (simdIndexOfNewline(content, current_line_start)) |nl| {
                     if (nl < pos) { current_line += 1; current_line_start = nl + 1; } else break;
                 } else break;
             }
             const line_start = current_line_start;
-            const line_end = if (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| nl else content.len;
+            const line_end = simdIndexOfNewline(content, pos) orelse content.len;
 
             const line_text = try allocator.dupe(u8, content[line_start..line_end]);
             errdefer allocator.free(line_text);
@@ -2814,6 +2814,29 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         pos += 1;
     }
 }
+
+/// SIMD-accelerated newline search from `start` in `content`.
+/// Returns index of first '\n' at or after `start`, or null.
+inline fn simdIndexOfNewline(content: []const u8, start: usize) ?usize {
+    const VW = 16;
+    const Vec = @Vector(VW, u8);
+    const splat_nl: Vec = @splat('\n');
+    var pos = start;
+
+    while (pos + VW <= content.len) {
+        const chunk: Vec = content[pos..][0..VW].*;
+        const eq: @Vector(VW, u1) = @bitCast(chunk == splat_nl);
+        const mask: u16 = @bitCast(eq);
+        if (mask != 0) return pos + @ctz(mask);
+        pos += VW;
+    }
+    while (pos < content.len) {
+        if (content[pos] == '\n') return pos;
+        pos += 1;
+    }
+    return null;
+}
+
 
 
 fn extractLineByNumber(content: []const u8, target_line: u32) ?[]const u8 {
