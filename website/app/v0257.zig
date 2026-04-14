@@ -280,12 +280,12 @@ const html =
     \\  new Chart(document.getElementById('searchChart'), {
     \\    type: 'bar',
     \\    data: { labels: ['codedb', 'ripgrep', 'grep'], datasets: [{ data: [0.5, 500, 1500], backgroundColor: [green, '#9ca3af', gray], borderRadius: 4, barThickness: 32 }] },
-    \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { type: 'logarithmic', title: { display: true, text: 'ms (log scale)' }, grid: { color: '#f3f4f6' }, ticks: { callback: function(v) { return v < 1 ? v*1000 + 'µs' : v + 'ms'; } } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
+    \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'ms (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  new Chart(document.getElementById('resultsChart'), {
     \\    type: 'bar',
     \\    data: { labels: ['codedb (20)', 'ripgrep (2959)', 'grep (2973)'], datasets: [{ data: [20, 2959, 2973], backgroundColor: [green, '#9ca3af', gray], borderRadius: 4, barThickness: 32 }] },
-    \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { type: 'logarithmic', title: { display: true, text: 'results (log scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
+    \\    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { title: { display: true, text: 'results (linear scale)' }, grid: { color: '#f3f4f6' } }, y: { grid: { display: false }, ticks: { font: { family: "'Geist', sans-serif", size: 13, weight: 600 }, color: '#111' } } } }
     \\  });
     \\  document.getElementById('burger')?.addEventListener('click', function() { this.classList.toggle('open'); document.getElementById('nav-links').classList.toggle('open'); });
     \\</script>
