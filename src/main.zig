@@ -63,36 +63,56 @@ fn mainImpl() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    // Parse --port N from anywhere in args, then strip it so command dispatch doesn't see it.
+    var port_override: ?u16 = null;
+    var filtered_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
+    defer filtered_args.deinit(allocator);
+    filtered_args.appendAssumeCapacity(args[0]); // program name
+    {
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.startsWith(u8, args[i], "--port=")) {
+                port_override = std.fmt.parseInt(u16, args[i]["--port=".len..], 10) catch null;
+            } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+                port_override = std.fmt.parseInt(u16, args[i + 1], 10) catch null;
+                i += 1; // skip the value arg too
+            } else {
+                filtered_args.appendAssumeCapacity(args[i]);
+            }
+        }
+    }
+    const fargs = filtered_args.items;
+
     var root: []const u8 = undefined;
     var cmd: []const u8 = undefined;
     var cmd_args_start: usize = undefined;
 
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mcp")) {
+    if (fargs.len >= 2 and std.mem.eql(u8, fargs[1], "--mcp")) {
         root = ".";
         cmd = "mcp";
         cmd_args_start = 2;
-    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v"))) {
+    } else if (fargs.len >= 2 and (std.mem.eql(u8, fargs[1], "--version") or std.mem.eql(u8, fargs[1], "-v"))) {
         root = ".";
         cmd = "--version";
         cmd_args_start = 2;
-    } else if (args.len >= 2 and
-        (std.mem.eql(u8, args[1], "--help") or
-            std.mem.eql(u8, args[1], "-h") or
-            std.mem.eql(u8, args[1], "help")))
+    } else if (fargs.len >= 2 and
+        (std.mem.eql(u8, fargs[1], "--help") or
+            std.mem.eql(u8, fargs[1], "-h") or
+            std.mem.eql(u8, fargs[1], "help")))
     {
         root = ".";
-        cmd = args[1];
+        cmd = fargs[1];
         cmd_args_start = 2;
-    } else if (args.len < 2) {
+    } else if (fargs.len < 2) {
         printUsage(out, s);
         std.process.exit(1);
-    } else if (isCommand(args[1])) {
+    } else if (isCommand(fargs[1])) {
         root = ".";
-        cmd = args[1];
+        cmd = fargs[1];
         cmd_args_start = 2;
-    } else if (args.len >= 3) {
-        root = args[1];
-        cmd = args[2];
+    } else if (fargs.len >= 3) {
+        root = fargs[1];
+        cmd = fargs[2];
         cmd_args_start = 3;
     } else {
         printUsage(out, s);
@@ -569,7 +589,7 @@ fn mainImpl() !void {
             s.reset,
         });
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        const port: u16 = 7719;
+        const port: u16 = port_override orelse 7719;
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
@@ -792,7 +812,7 @@ fn printUsage(out: Out, s: sty.Style) void {
     });
     out.p(
         \\    {s}hot{s}                       recently modified files
-        \\    {s}serve{s}                     HTTP daemon on :7719
+        \\    {s}serve{s}                     HTTP daemon (default :7719, override with --port N)
         \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\    {s}update{s}                    self-update to the latest verified release
         \\    {s}nuke{s}                      uninstall codedb, clear caches, and deregister integrations

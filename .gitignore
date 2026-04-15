@@ -31,3 +31,6 @@ socials/
 scripts/codedb-turn-context.local.toml
 scripts/codedb-turn-context.toml
 scripts/__pycache__/
+
+# Go CLI build artifact (binary is machine-specific)
+cli/codedb-cli

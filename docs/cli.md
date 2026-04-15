@@ -82,15 +82,15 @@ codedb-cli [root] <command> [args...]
 
 ## Machine Workflow
 
-The default machine roots mirror bm25x:
+Configure your machine roots in `~/.config/codedb-cli/config.toml`:
 
-- `~/Documents/GitHub`
-- `~/Documents/OpenProse-GitHub`
-- `~/raw-agent-private`
-- `~/.agents`
-- `~/.pi`
-- `~/.config`
-- `~/Documents/raw-obsidian-sync`
+```toml
+roots = [
+  "~/src",
+  "~/projects",
+  "~/work",
+]
+```
 
 Use the machine workflow to discover the right repo first:
 
@@ -163,18 +163,18 @@ codedb-cli machine search "codedb-cli" 3
 codedb-cli machine word "asyncio" 10
 
 # Then switch to focused per-repo structural work
-codedb-cli /home/raw/Documents/GitHub/codedb tree | head -20
-codedb-cli /home/raw/Documents/GitHub/codedb outline src/main.zig
+codedb-cli /path/to/repo tree | head -20
+codedb-cli /path/to/repo outline src/main.zig
 
 # Find where a symbol is defined
-codedb-cli /home/raw/Documents/GitHub/codedb find Store
+codedb-cli /path/to/repo find Store
 # src/store.zig:16  struct_def  pub const Store = struct {
 # src/explore.zig:2 import      const Store = @import("store.zig").Store;
 
 # Search and pipe to other tools inside one repo
-codedb-cli /home/raw/Documents/GitHub/codedb search "error" | grep "server.zig"
-codedb-cli /home/raw/Documents/GitHub/codedb word "allocator" | wc -l
+codedb-cli /path/to/repo search "error" | grep "server.zig"
+codedb-cli /path/to/repo word "allocator" | wc -l
 
 # Read specific lines
-codedb-cli /home/raw/Documents/GitHub/codedb read src/explore.zig 106 130
+codedb-cli /path/to/repo read src/explore.zig 106 130
 ```

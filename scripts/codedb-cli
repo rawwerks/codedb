@@ -225,14 +225,11 @@ _urlencode() {
 }
 
 _machine_default_roots() {
+    # Override with CODEDB_MACHINE_ROOTS or edit this list for your machine.
+    # See also: ~/.config/codedb-cli/config.toml (used by the Go CLI).
     cat <<EOF
-$HOME_DIR/Documents/GitHub
-$HOME_DIR/Documents/OpenProse-GitHub
-$HOME_DIR/raw-agent-private
-$HOME_DIR/.agents
-$HOME_DIR/.pi
-$HOME_DIR/.config
-$HOME_DIR/Documents/raw-obsidian-sync
+$HOME_DIR/src
+$HOME_DIR/projects
 EOF
 }
 
@@ -496,12 +493,12 @@ case "$cmd" in
     outline)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli outline <path>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _query_jq_text "/explore/outline?path=$(_urlencode "$1")" '.symbols[]? | "L\(.line_start)\t\(.kind)\t\(.name)\t\(.detail // \"\")"'
+        _query_jq_text "/explore/outline?path=$(_urlencode "$1")" '.symbols[]? | "L\(.line_start)\t\(.kind)\t\(.name)\t\(.detail // "")"'
         ;;
     find|symbol)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli find <symbol>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _query_jq_text "/explore/symbol?name=$(_urlencode "$1")" '.results[]? | "\(.path):\(.line)\t\(.kind)\t\(.detail // \"\")"'
+        _query_jq_text "/explore/symbol?name=$(_urlencode "$1")" '.results[]? | "\(.path):\(.line)\t\(.kind)\t\(.detail // "")"'
         ;;
     search)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli search <query> [max]" >&2; exit 1; }
