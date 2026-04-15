@@ -40,7 +40,7 @@ pub const Telemetry = struct {
     buf: [4096]u8 = undefined,
     path_buf: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
-    call_count: u32 = 0,
+    call_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     write_lock: std.Thread.Mutex = .{},
 
     pub fn init(data_dir: []const u8, allocator: std.mem.Allocator, disabled: bool) Telemetry {
@@ -84,11 +84,11 @@ pub const Telemetry = struct {
         }
         self.write_lock.unlock();
 
-        self.call_count += 1;
-        if (self.call_count % 3 == 0) {
+        const count = self.call_count.fetchAdd(1, .monotonic) + 1;
+        if (count % 3 == 0) {
             self.flush();
         }
-        if (self.call_count % 10 == 0) {
+        if (count % 10 == 0) {
             self.syncToCloud();
         }
     }
@@ -181,6 +181,11 @@ pub const Telemetry = struct {
         } else |_| {}
     }
 
+    pub fn syncWalToCloud(self: *Telemetry, wal_path: ?[]const u8) void {
+        _ = wal_path;
+        self.syncToCloud();
+    }
+
     fn formatEvent(self: *Telemetry, ev: *const Event) !usize {
         var fbs = std.io.fixedBufferStream(&self.buf);
         const w = fbs.writer();
@@ -225,6 +230,10 @@ fn writeLanguages(writer: anytype, language_mask: u16) !void {
         "typescript",
         "rust",
         "go_lang",
+        "php",
+        "ruby",
+        "hcl",
+        "r",
         "markdown",
         "json",
         "yaml",
@@ -240,7 +249,7 @@ fn writeLanguages(writer: anytype, language_mask: u16) !void {
     }
 }
 
-fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
+pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
     var total: u64 = 0;
 
     var word_iter = explorer.word_index.index.iterator();
@@ -251,18 +260,22 @@ fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
 
     var file_words_iter = explorer.word_index.file_words.iterator();
     while (file_words_iter.next()) |entry| {
-        total +|= entry.value_ptr.count() * @sizeOf(usize);
+        total +|= entry.value_ptr.len * @sizeOf(usize);
     }
 
-    var trigram_iter = explorer.trigram_index.index.iterator();
-    while (trigram_iter.next()) |entry| {
-        total +|= @sizeOf(@TypeOf(entry.key_ptr.*));
-        total +|= entry.value_ptr.count() * (@sizeOf(usize) + @sizeOf(index.PostingMask));
-    }
-
-    var file_trigrams_iter = explorer.trigram_index.file_trigrams.iterator();
-    while (file_trigrams_iter.next()) |entry| {
-        total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
+    switch (explorer.trigram_index) {
+        .heap => |heap| {
+            var trigram_iter = heap.index.iterator();
+            while (trigram_iter.next()) |entry| {
+                total +|= @sizeOf(@TypeOf(entry.key_ptr.*));
+                total +|= entry.value_ptr.count() * (@sizeOf(usize) + @sizeOf(index.PostingMask));
+            }
+            var file_trigrams_iter = heap.file_trigrams.iterator();
+            while (file_trigrams_iter.next()) |entry| {
+                total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
+            }
+        },
+        .mmap, .mmap_overlay => {},
     }
 
     var sparse_iter = explorer.sparse_ngram_index.index.iterator();

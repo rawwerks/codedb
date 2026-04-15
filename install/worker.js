@@ -1,5 +1,5 @@
 const GITHUB_REPO = "justrach/codedb";
-const FALLBACK_VERSION = "0.2.53";
+const FALLBACK_VERSION = "0.2.56";
 const INSTALL_SCRIPT_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/install/install.sh`;
 
 export default {
@@ -60,7 +60,7 @@ async function serveLatestVersion() {
     return new Response(JSON.stringify({ version }), {
       headers: {
         "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "public, max-age=60",
       },
     });
   }

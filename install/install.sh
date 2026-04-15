@@ -8,6 +8,24 @@ INSTALL_DIR="${CODEDB_DIR:-$HOME/bin}"
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m' B='\033[0;34m'
 C='\033[0;36m' W='\033[1;37m' D='\033[0;90m' N='\033[0m'
 
+fetch_latest_version() {
+  local version=""
+
+  version="$(curl -fsSL -A 'codedb-installer' \
+    "https://api.github.com/repos/justrach/codedb/releases/latest" 2>/dev/null \
+    | grep -oE '"tag_name"\s*:\s*"v[^"]*"' \
+    | cut -d'"' -f4 \
+    | sed 's/^v//')" || true
+
+  if [ -z "$version" ]; then
+    version="$(curl -fsSL -A 'codedb-installer' "$BASE_URL/latest.json" 2>/dev/null \
+      | grep -oE '"version"\s*:\s*"[^"]*"' \
+      | cut -d'"' -f4)" || true
+  fi
+
+  printf '%s' "$version"
+}
+
 detect_platform() {
   local os arch
   os="$(uname -s)"
@@ -22,7 +40,7 @@ detect_platform() {
       printf "  ${Y}Windows detected${N} — codedb is a native Linux/macOS binary.\n"
       printf "  Run this inside ${G}WSL2${N} instead:\n"
       echo ""
-      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | sh${N}\n"
+      printf "    ${C}wsl curl -fsSL https://codedb.codegraff.com/install.sh | bash${N}\n"
       echo ""
       exit 0
       ;;
@@ -161,7 +179,7 @@ main() {
 
   version="${CODEDB_VERSION:-}"
   if [ -z "$version" ]; then
-    version="$(curl -fsSL -A 'codedb-installer' "$BASE_URL/latest.json" | grep -oE '"version"\s*:\s*"[^"]*"' | cut -d'"' -f4)"
+    version="$(fetch_latest_version)"
   fi
   if [ -z "$version" ]; then
     printf "  ${R}error: could not fetch latest version${N}\n" >&2
@@ -175,16 +193,17 @@ main() {
   printf "  ${D}install${N}   $INSTALL_DIR\n"
   echo ""
 
-  local url="$BASE_URL/v${version}/codedb-${platform}${ext}"
-  local checksum_url="$BASE_URL/v${version}/checksums.sha256"
+  local url="https://github.com/justrach/codedb/releases/download/v${version}/codedb-${platform}${ext}"
+  local checksum_url="https://github.com/justrach/codedb/releases/download/v${version}/checksums.sha256"
   local dest="$INSTALL_DIR/codedb${ext}"
 
   printf "  ${D}│${N} %-12s " "codedb"
   local tmp="/tmp/codedb.tmp.$$"
   if curl -fsSL -A 'codedb-installer' "$url" -o "$tmp" 2>/dev/null; then
-    # Verify checksum if available (#120)
-    local expected_hash
-    expected_hash="$(curl -fsSL -A 'codedb-installer' "$checksum_url" 2>/dev/null | grep "codedb-${platform}${ext}" | awk '{print $1}')"
+    # Verify checksum when the release publishes a checksum manifest.
+    local checksum_text expected_hash checksum_notice=""
+    checksum_text="$(curl -fsSL -A 'codedb-installer' "$checksum_url" 2>/dev/null || true)"
+    expected_hash="$(printf '%s\n' "$checksum_text" | awk "/codedb-${platform}${ext}\$/ { print \$1 }")"
     if [ -n "$expected_hash" ]; then
       local actual_hash
       if command -v sha256sum >/dev/null 2>&1; then
@@ -200,6 +219,8 @@ main() {
         printf "  ${D}actual:   $actual_hash${N}\n" >&2
         exit 1
       fi
+    else
+      checksum_notice="  ${Y}warning:${N} checksum verification skipped (checksums.sha256 unavailable)\n"
     fi
     xattr -c "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$dest"
@@ -214,6 +235,9 @@ main() {
 
   echo ""
   printf "  ${G}installed${N} ${D}→ $dest${N}\n"
+  if [ -n "$checksum_notice" ]; then
+    printf "$checksum_notice"
+  fi
 
   # Register MCP server in coding tools
   echo ""

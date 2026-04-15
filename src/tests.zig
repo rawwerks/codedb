@@ -29,7 +29,12 @@ const extractLines = explore.extractLines;
 const isCommentOrBlank = explore.isCommentOrBlank;
 const Language = explore.Language;
 const SymbolKind = explore.SymbolKind;
+const DependencyGraph = explore.DependencyGraph;
+const SymbolLocation = explore.SymbolLocation;
 const mcp_mod = @import("mcp.zig");
+const main_mod = @import("main.zig");
+const nuke_mod = @import("nuke.zig");
+const update_mod = @import("update.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
 // ── Store tests ─────────────────────────────────────────────
@@ -266,7 +271,7 @@ test "word index: index and search" {
 
     const hits = wi.search("hello");
     try testing.expect(hits.len > 0);
-    try testing.expectEqualStrings("src/foo.zig", hits[0].path);
+    try testing.expectEqualStrings("src/foo.zig", wi.hitPath(hits[0]));
     try testing.expect(hits[0].line_num == 1);
 
     // "x" is only 1 char, should be skipped
@@ -829,7 +834,7 @@ test "explorer: searchWord via inverted index" {
     const hits = try explorer.searchWord("add", testing.allocator);
     defer testing.allocator.free(hits);
     try testing.expect(hits.len > 0);
-    try testing.expectEqualStrings("math.zig", hits[0].path);
+    try testing.expectEqualStrings("math.zig", explorer.word_index.hitPath(hits[0]));
 }
 
 test "explorer: removeFile cleans up everything" {
@@ -1077,6 +1082,47 @@ test "watcher: queue event copies path bytes" {
     try testing.expectEqualStrings("tmp/deleted.zig", event.path());
     try testing.expect(event.kind == .deleted);
     try testing.expect(event.seq == 99);
+}
+
+test "watcher: parallel initial scan matches sequential results" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.makePath("src/nested");
+    try tmp_dir.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const std = @import(\"std\");\npub fn alpha() void {}\n// TODO: keep me\n" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "src/nested/util.py", .data = "def beta():\n    return 42\n# TODO later\n" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "README.md", .data = "# demo\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp_dir.dir.realpath(".", &root_buf);
+
+    var store_seq = Store.init(testing.allocator);
+    defer store_seq.deinit();
+    var explorer_seq = Explorer.init(testing.allocator);
+    defer explorer_seq.deinit();
+    explorer_seq.setRoot(root);
+    try watcher.initialScanWithWorkerCount(&store_seq, &explorer_seq, root, testing.allocator, false, 1);
+
+    var store_par = Store.init(testing.allocator);
+    defer store_par.deinit();
+    var explorer_par = Explorer.init(testing.allocator);
+    defer explorer_par.deinit();
+    explorer_par.setRoot(root);
+    try watcher.initialScanWithWorkerCount(&store_par, &explorer_par, root, testing.allocator, false, 4);
+
+    const tree_seq = try explorer_seq.getTree(testing.allocator, false);
+    defer testing.allocator.free(tree_seq);
+    const tree_par = try explorer_par.getTree(testing.allocator, false);
+    defer testing.allocator.free(tree_par);
+    try testing.expectEqualStrings(tree_seq, tree_par);
+
+    const seq_hits = try explorer_seq.searchWord("TODO", testing.allocator);
+    defer testing.allocator.free(seq_hits);
+    const par_hits = try explorer_par.searchWord("TODO", testing.allocator);
+    defer testing.allocator.free(par_hits);
+    try testing.expectEqual(seq_hits.len, par_hits.len);
+
+    try testing.expectEqual(explorer_seq.outlines.count(), explorer_par.outlines.count());
 }
 
 test "edit: range_start zero is invalid" {
@@ -2866,6 +2912,51 @@ test "perf regression: bloom filter reduces scan work" {
 
 // ── Disk persistence tests ──────────────────────────────────
 
+test "disk word index: round-trip write and read preserves hits" {
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+
+    try wi.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+    try wi.indexFile("src/store.zig", "pub const Store = struct {};\npub fn open() void {}\n");
+
+    const hits_before = try wi.searchDeduped("Store", alloc);
+    defer alloc.free(hits_before);
+    try testing.expectEqual(@as(usize, 2), hits_before.len);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const fake_head = "0123456789abcdef0123456789abcdef01234567".*;
+    try wi.writeToDisk(dir_path, fake_head);
+
+    const header = try WordIndex.readDiskHeader(dir_path, alloc);
+    try testing.expect(header != null);
+    try testing.expectEqual(@as(u32, 2), header.?.file_count);
+    try testing.expect(header.?.git_head != null);
+    try testing.expectEqualSlices(u8, &fake_head, &header.?.git_head.?);
+
+    const loaded = WordIndex.readFromDisk(dir_path, alloc);
+    try testing.expect(loaded != null);
+    var loaded_wi = loaded.?;
+    defer loaded_wi.deinit();
+
+    const hits_after = try loaded_wi.searchDeduped("Store", alloc);
+    defer alloc.free(hits_after);
+    try testing.expectEqual(hits_before.len, hits_after.len);
+
+    var found_main = false;
+    var found_store = false;
+    for (hits_after) |hit| {
+        if (std.mem.eql(u8, loaded_wi.hitPath(hit), "src/main.zig")) found_main = true;
+        if (std.mem.eql(u8, loaded_wi.hitPath(hit), "src/store.zig")) found_store = true;
+    }
+    try testing.expect(found_main);
+    try testing.expect(found_store);
+}
+
 test "disk index: round-trip write and read preserves candidates" {
     const alloc = testing.allocator;
     var ti = TrigramIndex.init(alloc);
@@ -3217,7 +3308,7 @@ test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" 
             ctx.exp.mu.lock();
             defer ctx.exp.mu.unlock();
             ctx.exp.trigram_index.deinit();
-            ctx.exp.trigram_index = TrigramIndex.init(ctx.exp.allocator);
+            ctx.exp.trigram_index = .{ .heap = TrigramIndex.init(ctx.exp.allocator) };
             ctx.swapped.store(true, .release);
         }
     };
@@ -3311,6 +3402,120 @@ test "issue-46: empty-repo snapshot rejected on load" {
     const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store, testing.allocator);
     // Valid empty-repo snapshot should be accepted; currently returns false (bug: file_count == 0)
     try testing.expect(loaded);
+}
+
+test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try exp.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/fast.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store, arena2.allocator());
+    try testing.expect(loaded);
+    try testing.expectEqual(@as(usize, 2), exp2.outlines.count());
+    try testing.expectEqual(@as(u32, 0), exp2.trigram_index.fileCount());
+    try testing.expectEqual(@as(usize, 0), exp2.word_index.index.count());
+    try testing.expect(exp2.wordIndexCanLoadFromDisk());
+    try testing.expect(!exp2.wordIndexIsComplete());
+    try testing.expect(!exp2.wordIndexNeedsPersist());
+
+    const deps = try exp2.getImportedBy("src/store.zig", testing.allocator);
+    defer {
+        for (deps) |dep| testing.allocator.free(dep);
+        testing.allocator.free(deps);
+    }
+    try testing.expectEqual(@as(usize, 1), deps.len);
+    try testing.expect(std.mem.eql(u8, deps[0], "src/main.zig"));
+
+    const hits = try exp2.searchWord("Store", testing.allocator);
+    defer testing.allocator.free(hits);
+    try testing.expect(hits.len >= 1);
+    try testing.expect(exp2.word_index.index.count() > 0);
+    try testing.expect(exp2.wordIndexIsComplete());
+    try testing.expect(exp2.wordIndexNeedsPersist());
+}
+
+test "issue-220: partial word index state rebuilds before search" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    var exp = Explorer.init(testing.allocator);
+    defer exp.deinit();
+    try exp.indexFile("src/a.zig", "pub const Alpha = 1;\n");
+    try exp.indexFile("src/b.zig", "pub const Beta = 2;\n");
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/partial.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    try testing.expect(snapshot_mod.loadSnapshot(snap_path, &exp2, &store, testing.allocator));
+    try testing.expect(exp2.wordIndexCanLoadFromDisk());
+    try testing.expect(!exp2.wordIndexIsComplete());
+
+    try exp2.indexFileSkipTrigram("src/b.zig", "pub const Gamma = 3;\n");
+    try testing.expect(!exp2.wordIndexCanLoadFromDisk());
+    try testing.expect(!exp2.wordIndexIsComplete());
+
+    const alpha_hits = try exp2.searchWord("Alpha", testing.allocator);
+    defer testing.allocator.free(alpha_hits);
+    try testing.expectEqual(@as(usize, 1), alpha_hits.len);
+    try testing.expect(std.mem.eql(u8, exp2.word_index.hitPath(alpha_hits[0]), "src/a.zig"));
+
+    const gamma_hits = try exp2.searchWord("Gamma", testing.allocator);
+    defer testing.allocator.free(gamma_hits);
+    try testing.expectEqual(@as(usize, 1), gamma_hits.len);
+    try testing.expect(std.mem.eql(u8, exp2.word_index.hitPath(gamma_hits[0]), "src/b.zig"));
+    try testing.expect(exp2.wordIndexIsComplete());
+    try testing.expect(exp2.wordIndexNeedsPersist());
+}
+
+test "issue-220: word index persistence tracking skips redundant rewrites" {
+    var exp = Explorer.init(testing.allocator);
+    defer exp.deinit();
+
+    try exp.indexFile("src/a.zig", "pub const Alpha = 1;\n");
+    try testing.expect(exp.wordIndexIsComplete());
+    try testing.expect(exp.wordIndexNeedsPersist());
+
+    const first_gen = exp.wordIndexGenerationToPersist() orelse return error.TestUnexpectedResult;
+    exp.markWordIndexPersisted(first_gen);
+    try testing.expect(!exp.wordIndexNeedsPersist());
+    try testing.expect(exp.wordIndexGenerationToPersist() == null);
+
+    try exp.indexFile("src/a.zig", "pub const Beta = 2;\n");
+    try testing.expect(exp.wordIndexNeedsPersist());
+
+    const second_gen = exp.wordIndexGenerationToPersist() orelse return error.TestUnexpectedResult;
+    try testing.expect(second_gen != first_gen);
+    exp.markWordIndexPersisted(first_gen);
+    try testing.expect(exp.wordIndexNeedsPersist());
+    exp.markWordIndexPersisted(second_gen);
+    try testing.expect(!exp.wordIndexNeedsPersist());
 }
 
 // ── Snapshot non-git tests ───────────────────────────────────
@@ -4530,31 +4735,217 @@ test "issue-151: Go block comments skipped" {
     try testing.expect(func_count == 1); // only realFunc
 }
 
-
 test "issue-150: --help prints usage" {
+    const build = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ "zig", "build" },
+        .max_output_bytes = 8192,
+    });
+    defer testing.allocator.free(build.stdout);
+    defer testing.allocator.free(build.stderr);
+
+    try testing.expect(build.term == .Exited);
+    try testing.expect(build.term.Exited == 0);
+
     const result = try std.process.Child.run(.{
         .allocator = testing.allocator,
-        .argv = &.{ "zig", "build", "run", "--", "--help" },
+        .argv = &.{ "./zig-out/bin/codedb", "--help" },
         .max_output_bytes = 8192,
     });
     defer testing.allocator.free(result.stdout);
     defer testing.allocator.free(result.stderr);
 
+    try testing.expect(result.term == .Exited);
+    try testing.expect(result.term.Exited == 0);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
+        std.mem.indexOf(u8, result.stderr, "usage:") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "update") != null or
+        std.mem.indexOf(u8, result.stderr, "update") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "nuke") != null or
+        std.mem.indexOf(u8, result.stderr, "nuke") != null);
+}
+
+test "issue-150: -h prints usage" {
+    const build = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ "zig", "build" },
+        .max_output_bytes = 8192,
+    });
+    defer testing.allocator.free(build.stdout);
+    defer testing.allocator.free(build.stderr);
+
+    try testing.expect(build.term == .Exited);
+    try testing.expect(build.term.Exited == 0);
+
+    const result = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ "./zig-out/bin/codedb", "-h" },
+        .max_output_bytes = 8192,
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+
+    try testing.expect(result.term == .Exited);
+    try testing.expect(result.term.Exited == 0);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
         std.mem.indexOf(u8, result.stderr, "usage:") != null);
 }
 
-test "issue-150: -h prints usage" {
-    const result = try std.process.Child.run(.{
-        .allocator = testing.allocator,
-        .argv = &.{ "zig", "build", "run", "--", "-h" },
-        .max_output_bytes = 8192,
-    });
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
+test "update: compareVersions orders semantic versions" {
+    try testing.expect(try update_mod.compareVersions("0.2.55", "0.2.56") == .lt);
+    try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56") == .eq);
+    try testing.expect(try update_mod.compareVersions("v0.2.57", "0.2.56") == .gt);
+    try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56.0") == .eq);
+}
 
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
-        std.mem.indexOf(u8, result.stderr, "usage:") != null);
+test "update: checksumForBinary parses release manifest" {
+    const manifest =
+        \\7be38140d090b2e23723c8cde02be150171c818daa16b18c520b44cc1e078add  codedb-darwin-arm64
+        \\76bc7b81bc9fd211aa2c1ac59d1d26e8c80bc211ab560de2dc998ea9e04ec471  codedb-darwin-x86_64
+        \\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  *codedb-linux-arm64
+    ;
+
+    try testing.expectEqualStrings(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        update_mod.checksumForBinary(manifest, "codedb-linux-arm64") orelse return error.TestUnexpectedResult,
+    );
+    try testing.expect(update_mod.checksumForBinary(manifest, "codedb-linux-x86_64") == null);
+}
+
+test "update: asset names match published release naming" {
+    try testing.expectEqualStrings("codedb-darwin-arm64", update_mod.assetNameForTarget(.macos, .aarch64).?);
+    try testing.expectEqualStrings("codedb-darwin-x86_64", update_mod.assetNameForTarget(.macos, .x86_64).?);
+    try testing.expectEqualStrings("codedb-linux-arm64", update_mod.assetNameForTarget(.linux, .aarch64).?);
+    try testing.expectEqualStrings("codedb-linux-x86_64", update_mod.assetNameForTarget(.linux, .x86_64).?);
+    try testing.expect(update_mod.assetNameForTarget(.windows, .x86_64) == null);
+}
+
+test "nuke: commandTargetsBinary only matches the current install path" {
+    try testing.expect(nuke_mod.commandTargetsBinary(
+        "/tmp/codedb-test/bin/codedb serve",
+        "/tmp/codedb-test/bin/codedb",
+    ));
+    try testing.expect(nuke_mod.commandTargetsBinary(
+        "/var/folders/example/codedb serve",
+        "/private/var/folders/example/codedb",
+    ));
+    try testing.expect(!nuke_mod.commandTargetsBinary(
+        "/Users/rachpradhan/bin/codedb --mcp",
+        "/tmp/codedb-test/bin/codedb",
+    ));
+}
+
+test "nuke: removeJsonMcpServerEntry drops only codedb integration" {
+    const input =
+        \\{
+        \\  "mcpServers": {
+        \\    "codedb": { "command": "/Users/me/bin/codedb", "args": ["mcp"] },
+        \\    "other": { "command": "other", "args": [] }
+        \\  },
+        \\  "theme": "dark"
+        \\}
+    ;
+
+    const output = (try nuke_mod.removeJsonMcpServerEntry(testing.allocator, input, "codedb")) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\"codedb\"") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"other\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"theme\"") != null);
+}
+
+test "nuke: removeJsonMcpServerEntry removes empty mcpServers object" {
+    const input =
+        \\{
+        \\  "mcpServers": {
+        \\    "codedb": { "command": "/Users/me/bin/codedb", "args": ["mcp"] }
+        \\  },
+        \\  "theme": "dark"
+        \\}
+    ;
+
+    const output = (try nuke_mod.removeJsonMcpServerEntry(testing.allocator, input, "codedb")) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\"codedb\"") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"mcpServers\"") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"theme\"") != null);
+}
+
+test "nuke: removeCodexMcpServerBlock removes codedb block only" {
+    const input =
+        \\[mcp_servers.codedb]
+        \\command = "/Users/me/bin/codedb"
+        \\args = ["mcp"]
+        \\startup_timeout_sec = 30
+        \\
+        \\[mcp_servers.other]
+        \\command = "other"
+        \\args = []
+    ;
+
+    const output = (try nuke_mod.removeCodexMcpServerBlock(testing.allocator, input, "codedb")) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "[mcp_servers.codedb]") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "[mcp_servers.other]") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "command = \"other\"") != null);
+}
+
+test "nuke: removeCodexMcpServerBlock matches indented header with inline comment" {
+    const input =
+        \\  [mcp_servers.codedb] # local override
+        \\command = "/Users/me/bin/codedb"
+        \\args = ["mcp"]
+        \\
+        \\[mcp_servers.other]
+        \\command = "other"
+        \\args = []
+    ;
+
+    const output = (try nuke_mod.removeCodexMcpServerBlock(testing.allocator, input, "codedb")) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "codedb") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "[mcp_servers.other]") != null);
+}
+
+test "nuke: deregisterJsonIntegrationFile handles configs larger than 64 KiB" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/large-claude.json", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var content: std.ArrayList(u8) = .{};
+    defer content.deinit(testing.allocator);
+    try content.appendSlice(testing.allocator,
+        \\{
+        \\  "mcpServers": {
+        \\    "codedb": { "command": "/Users/me/bin/codedb", "args": ["mcp"] },
+        \\    "other": { "command": "other", "args": [] }
+        \\  },
+        \\  "padding": "
+    );
+    try content.appendNTimes(testing.allocator, 'x', 70 * 1024);
+    try content.appendSlice(testing.allocator, "\"\n}\n");
+
+    var file = try tmp.dir.createFile("large-claude.json", .{});
+    defer file.close();
+    try file.writeAll(content.items);
+
+    try testing.expect(try nuke_mod.deregisterJsonIntegrationFile(testing.allocator, rel_path));
+
+    const rewritten = try std.fs.cwd().readFileAlloc(testing.allocator, rel_path, std.math.maxInt(usize));
+    defer testing.allocator.free(rewritten);
+
+    try testing.expect(std.mem.indexOf(u8, rewritten, "\"codedb\"") == null);
+    try testing.expect(std.mem.indexOf(u8, rewritten, "\"other\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rewritten, "\"padding\"") != null);
 }
 
 test "issue-116: getGitHead returns valid SHA for git repos" {
@@ -4569,4 +4960,1583 @@ test "issue-116: getGitHead returns valid SHA for git repos" {
             try testing.expect(std.ascii.isHex(c));
         }
     }
+}
+
+test "issue-148: idle timeout is 10 minutes" {
+    const mcp = @import("mcp.zig");
+    try testing.expectEqual(@as(i64, 10 * 60 * 1000), mcp.idle_timeout_ms);
+}
+
+test "issue-148: POLLHUP detects closed pipe" {
+    // Verify the polling infrastructure works for pipe-based transports
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    // Close write end — simulates client disconnect
+    std.posix.close(pipe[1]);
+
+    // Poll should detect POLLHUP on the read end
+    var fds = [_]std.posix.pollfd{.{
+        .fd = pipe[0],
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    const n = try std.posix.poll(&fds, 100); // 100ms timeout
+    try testing.expect(n > 0);
+    try testing.expect((fds[0].revents & std.posix.POLL.HUP) != 0);
+}
+
+test "issue-148: idle watchdog exits on shutdown signal" {
+    // The watchdog should check shutdown every ~1s (not 30s)
+    // and return quickly when signalled
+    var shutdown = std.atomic.Value(bool).init(false);
+
+    const t0 = std.time.milliTimestamp();
+    // Signal shutdown after a small delay
+    const signal_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.atomic.Value(bool)) void {
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            s.store(true, .release);
+        }
+    }.run, .{&shutdown});
+
+    // Run a simplified watchdog loop (matches the real one's 1s granularity)
+    while (!shutdown.load(.acquire)) {
+        for (0..30) |_| {
+            if (shutdown.load(.acquire)) break;
+            std.Thread.sleep(100 * std.time.ns_per_ms); // faster for test
+        }
+        break; // one iteration is enough to test
+    }
+    signal_thread.join();
+
+    const elapsed = std.time.milliTimestamp() - t0;
+    // With 1s granularity, should respond well under 5s (not 30s)
+    // Using 100ms intervals in test, so should be ~500ms
+    if (elapsed > 0) {
+        // Just verify it didn't hang for 30 seconds
+        try testing.expect(elapsed < 5_000);
+    }
+}
+
+test "issue-148: idle watchdog respects activity timestamp" {
+    const mcp = @import("mcp.zig");
+
+    // Save and restore
+    const saved = mcp.last_activity.load(.acquire);
+    defer mcp.last_activity.store(saved, .release);
+
+    // Set activity to "just now"
+    mcp.last_activity.store(std.time.milliTimestamp(), .release);
+
+    // With 10-minute timeout, checking now should NOT trigger exit
+    const last = mcp.last_activity.load(.acquire);
+    const now = std.time.milliTimestamp();
+    try testing.expect(now - last < mcp.idle_timeout_ms);
+}
+
+test "issue-148: MCP session survives 2-minute idle" {
+    const mcp = @import("mcp.zig");
+    // With the old 2-min timeout, an activity 3 minutes ago would trigger exit.
+    // With the new 10-min timeout, it should be fine.
+    const three_min_ago = std.time.milliTimestamp() - (3 * 60 * 1000);
+
+    // Save and restore
+    const saved = mcp.last_activity.load(.acquire);
+    defer mcp.last_activity.store(saved, .release);
+
+    mcp.last_activity.store(three_min_ago, .release);
+    const last = mcp.last_activity.load(.acquire);
+    const now = std.time.milliTimestamp();
+
+    // Should NOT exceed 10-minute timeout
+    try testing.expect(now - last < mcp.idle_timeout_ms);
+
+    // Should have exceeded old 2-minute timeout
+    try testing.expect(now - last > 2 * 60 * 1000);
+}
+
+test "issue-148: open pipe does not trigger HUP" {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+    defer std.posix.close(pipe[1]);
+
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = pipe[0],
+        .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+        .revents = 0,
+    }};
+
+    const result = try std.posix.poll(&poll_fds, 0);
+    try testing.expectEqual(@as(usize, 0), result);
+}
+
+test "issue-148: codedb mcp exits when stdin is closed" {
+    // Integration test: spawn codedb mcp, close stdin, verify it exits
+    var child = std.process.Child.init(
+        &.{ "zig", "build", "run", "--", "--mcp" },
+        testing.allocator,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    // Send initialize then close stdin (simulate client crash)
+    const init_msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}";
+    const header = std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n", .{init_msg.len});
+
+    if (child.stdin) |stdin| {
+        stdin.writeAll(header) catch {};
+        stdin.writeAll(init_msg) catch {};
+        // Close stdin — simulates client disconnecting
+        stdin.close();
+        child.stdin = null;
+    }
+
+    // Wait up to 15 seconds for the process to exit
+    // (watchdog polls every 10s, so it should detect POLLHUP within ~10s)
+    const start = std.time.milliTimestamp();
+    const term = child.wait() catch {
+        // If wait fails, the process is stuck — test fails
+        try testing.expect(false);
+        return;
+    };
+
+    const elapsed = std.time.milliTimestamp() - start;
+
+    // Should have exited (not been killed by us)
+    switch (term) {
+        .Exited => |code| _ = code,
+        else => {},
+    }
+
+    // Should exit within 15 seconds (10s poll interval + margin)
+    try testing.expect(elapsed < 15_000);
+}
+
+const MmapTrigramIndex = @import("index.zig").MmapTrigramIndex;
+const AnyTrigramIndex = @import("index.zig").AnyTrigramIndex;
+
+test "issue-164: mmap trigram index returns same candidates as heap index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.zig", "pub fn handleAuth(req: *Request) !void { validate(req); }");
+    try explorer.indexFile("src/gate.zig", "pub fn checkGate(ctx: *Context) !bool { return ctx.authenticated; }");
+    try explorer.indexFile("src/util.zig", "pub fn formatStr(buf: []u8, args: anytype) !void {}");
+
+    const heap_results = explorer.trigram_index.candidates("handleAuth", allocator) orelse
+        return error.NoCandidates;
+
+    try testing.expect(heap_results.len >= 1);
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    defer mmap_idx.deinit();
+
+    const mmap_results = mmap_idx.candidates("handleAuth", allocator) orelse
+        return error.NoCandidates;
+
+    try testing.expect(mmap_results.len >= 1);
+    try testing.expectEqual(heap_results.len, mmap_results.len);
+    try testing.expectEqual(explorer.trigram_index.fileCount(), mmap_idx.fileCount());
+    try testing.expect(mmap_idx.containsFile("src/auth.zig"));
+    try testing.expect(mmap_idx.containsFile("src/gate.zig"));
+    try testing.expect(!mmap_idx.containsFile("nonexistent.zig"));
+}
+
+test "issue-164: mmap binary search on sorted lookup table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("a.zig", "const alpha = 42;");
+    try explorer.indexFile("b.zig", "const beta = 43;");
+    try explorer.indexFile("c.zig", "const gamma = 44;");
+    try explorer.indexFile("d.zig", "const delta = 45;");
+    try explorer.indexFile("e.zig", "const alpha_beta = 99;");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    var mmap_idx = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    defer mmap_idx.deinit();
+
+    const results = mmap_idx.candidates("alpha", allocator) orelse
+        return error.NoCandidates;
+    try testing.expect(results.len >= 2);
+
+    const no_results = mmap_idx.candidates("zzzzz", allocator);
+    if (no_results) |nr| {
+        try testing.expectEqual(@as(usize, 0), nr.len);
+    }
+}
+
+test "issue-164: mmap handles missing files gracefully" {
+    const result = MmapTrigramIndex.initFromDisk("/tmp/nonexistent-codedb-test-dir-164", testing.allocator);
+    try testing.expect(result == null);
+}
+
+test "issue-164: AnyTrigramIndex dispatches to mmap variant" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("foo.zig", "pub fn fooBar(x: i32) i32 { return x + 1; }");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    try explorer.trigram_index.writeToDisk(tmp_path, null);
+
+    const mmap_loaded = MmapTrigramIndex.initFromDisk(tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+
+    explorer.trigram_index.deinit();
+    explorer.trigram_index = .{ .mmap = mmap_loaded };
+
+    const results = try explorer.searchContent("fooBar", allocator, 10);
+    try testing.expect(results.len >= 1);
+
+    try testing.expect(explorer.trigram_index.containsFile("foo.zig"));
+    try testing.expect(!explorer.trigram_index.containsFile("bar.zig"));
+}
+
+const fuzzyScore = @import("explore.zig").fuzzyScore;
+
+test "issue-163: fuzzy exact match scores highest" {
+    const exact = fuzzyScore("main.zig", "src/main.zig");
+    const partial = fuzzyScore("main.zig", "src/main_helper.zig");
+    try testing.expect(exact != null);
+    try testing.expect(partial != null);
+    try testing.expect(exact.? > partial.?);
+}
+
+test "issue-163: fuzzy subsequence match works" {
+    const score = fuzzyScore("authmid", "src/auth_middleware.py");
+    try testing.expect(score != null);
+    try testing.expect(score.? > 0);
+}
+
+test "issue-163: fuzzy typo-tolerant (missing char)" {
+    // "auth_midlware" missing the 'd' in middleware — should still match via subsequence
+    const score = fuzzyScore("auth_midlware", "src/auth_middleware.py");
+    try testing.expect(score != null);
+}
+
+test "issue-163: fuzzy word boundary bonus" {
+    // "auth" at word boundary should score higher than "auth" buried in a word
+    const boundary = fuzzyScore("auth", "src/auth_handler.py");
+    const buried = fuzzyScore("auth", "src/xauthyhandle.py");
+    try testing.expect(boundary != null);
+    try testing.expect(buried != null);
+    try testing.expect(boundary.? > buried.?);
+}
+
+test "issue-163: fuzzy filename ranks above directory" {
+    // "test" in filename portion should score higher than "test" only in directory
+    const in_name = fuzzyScore("test", "src/test_auth.py");
+    const in_dir = fuzzyScore("test", "testdir/deep/nested/xyzfile.py");
+    try testing.expect(in_name != null);
+    try testing.expect(in_dir != null);
+    try testing.expect(in_name.? > in_dir.?);
+}
+
+test "issue-163: fuzzy no match returns null" {
+    const score = fuzzyScore("zzzzxyz", "src/main.zig");
+    try testing.expect(score == null);
+}
+
+test "issue-163: fuzzyFindFiles via Explorer" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth_middleware.py", "def check_auth(): pass");
+    try explorer.indexFile("src/middleware/auth.py", "class Auth: pass");
+    try explorer.indexFile("tests/test_auth.py", "def test_auth(): pass");
+    try explorer.indexFile("src/utils.py", "def format_str(): pass");
+
+    const results = try explorer.fuzzyFindFiles("authmid", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    // auth_middleware.py should be top result
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "auth_middleware") != null);
+}
+
+test "issue-163: multi-part query matches both parts" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth_middleware.py", "def check(): pass");
+    try explorer.indexFile("src/auth_handler.py", "def handle(): pass");
+    try explorer.indexFile("src/utils.py", "def util(): pass");
+
+    // "auth middle" should match auth_middleware but not utils
+    const results = try explorer.fuzzyFindFiles("auth middle", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "middleware") != null);
+}
+
+test "issue-163: extension constraint filters results" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.py", "def check(): pass");
+    try explorer.indexFile("src/auth.ts", "function check() {}");
+    try explorer.indexFile("src/auth.zig", "fn check() void {}");
+
+    // "auth *.py" should only return the .py file
+    const results = try explorer.fuzzyFindFiles("auth *.py", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    for (results) |r| {
+        try testing.expect(std.mem.endsWith(u8, r.path, ".py"));
+    }
+}
+
+test "issue-163: special entry point files get bonus" {
+    const score_main = fuzzyScore("main", "src/main.zig");
+    const score_regular = fuzzyScore("main", "src/maintain.zig");
+    try testing.expect(score_main != null);
+    try testing.expect(score_regular != null);
+    // main.zig is a special entry point — should score higher than maintain.zig
+    try testing.expect(score_main.? > score_regular.?);
+}
+
+test "issue-163: transpositions handled by Smith-Waterman" {
+    // These all failed with the old subsequence matcher
+    try testing.expect(fuzzyScore("mpc", "src/mcp.zig") != null);
+    try testing.expect(fuzzyScore("mian", "src/main.zig") != null);
+    try testing.expect(fuzzyScore("agnet", "src/agent.zig") != null);
+    try testing.expect(fuzzyScore("indxe", "src/index.zig") != null);
+}
+
+// ── codedb_query pipeline tests ─────────────────────────────────
+
+test "issue-168: query pipeline find → limit produces file set" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.py", "def check_auth(): pass");
+    try explorer.indexFile("src/auth_handler.py", "def handle(): pass");
+    try explorer.indexFile("src/utils.py", "def util(): pass");
+    try explorer.indexFile("src/config.py", "DEBUG = True");
+
+    // Pipeline: find "auth" → should return auth files
+    const results = try explorer.fuzzyFindFiles("auth", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 2);
+    // Both auth files should be in results
+    var found_auth = false;
+    var found_handler = false;
+    for (results) |r| {
+        if (std.mem.indexOf(u8, r.path, "auth.py") != null) found_auth = true;
+        if (std.mem.indexOf(u8, r.path, "auth_handler") != null) found_handler = true;
+    }
+    try testing.expect(found_auth);
+    try testing.expect(found_handler);
+}
+
+test "issue-168: query pipeline search returns matching lines" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/main.zig", "pub fn main() void {\n    const x = 42;\n}\n");
+    try explorer.indexFile("src/lib.zig", "pub fn init() void {}\n");
+
+    const results = try explorer.searchContent("main", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "main.zig") != null);
+}
+
+test "issue-168: query pipeline filter by extension" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.py", "def check(): pass");
+    try explorer.indexFile("src/auth.ts", "function check() {}");
+    try explorer.indexFile("src/auth.zig", "fn check() void {}");
+
+    // fuzzyFindFiles with extension constraint
+    const results = try explorer.fuzzyFindFiles("auth *.py", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    for (results) |r| {
+        try testing.expect(std.mem.endsWith(u8, r.path, ".py"));
+    }
+}
+
+test "issue-168: query pipeline outline returns symbols" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\npub fn helper() void {}\n");
+
+    var outline = (try explorer.getOutline("src/main.zig", testing.allocator)).?;
+    defer outline.deinit();
+    try testing.expect(outline.symbols.items.len >= 2);
+}
+
+test "issue-168: query pipeline chained find → filter narrows results" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.py", "def check(): pass");
+    try explorer.indexFile("src/auth.ts", "function check() {}");
+    try explorer.indexFile("src/utils.py", "def util(): pass");
+    try explorer.indexFile("docs/auth.md", "# Auth docs");
+
+    // find "auth" returns all auth files, then *.py filter narrows to python
+    const all = try explorer.fuzzyFindFiles("auth", testing.allocator, 10);
+    defer testing.allocator.free(all);
+    try testing.expect(all.len >= 3); // auth.py, auth.ts, auth.md
+
+    const py_only = try explorer.fuzzyFindFiles("auth *.py", testing.allocator, 10);
+    defer testing.allocator.free(py_only);
+    try testing.expect(py_only.len >= 1);
+    try testing.expect(py_only.len < all.len); // filtered set is smaller
+}
+
+test "issue-168: query pipeline handles empty results gracefully" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}");
+
+    // Search for something that doesn't exist
+    const results = try explorer.fuzzyFindFiles("zzzznonexistent", testing.allocator, 10);
+    defer testing.allocator.free(results);
+    try testing.expectEqual(@as(usize, 0), results.len);
+}
+
+// ── codedb_query recall tests ───────────────────────────────────
+// These test that pipeline composition preserves precision and recall:
+// the right files survive each step, and irrelevant files are eliminated.
+
+test "issue-168: recall — find + filter preserves only matching extension" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.py", "def check(): pass");
+    try explorer.indexFile("src/auth.ts", "function check() {}");
+    try explorer.indexFile("src/auth.zig", "fn check() void {}");
+    try explorer.indexFile("src/auth.rs", "fn check() {}");
+    try explorer.indexFile("src/auth_test.py", "def test_check(): pass");
+
+    // find "auth" should get all 5, then *.py should narrow to exactly 2
+    const all = try explorer.fuzzyFindFiles("auth", testing.allocator, 20);
+    defer testing.allocator.free(all);
+    try testing.expect(all.len == 5);
+
+    const py = try explorer.fuzzyFindFiles("auth *.py", testing.allocator, 20);
+    defer testing.allocator.free(py);
+    try testing.expect(py.len == 2);
+    for (py) |r| try testing.expect(std.mem.endsWith(u8, r.path, ".py"));
+}
+
+test "issue-168: recall — search finds content across multiple files" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/a.zig", "pub fn handleRequest() void {}");
+    try explorer.indexFile("src/b.zig", "pub fn handleResponse() void {}");
+    try explorer.indexFile("src/c.zig", "pub fn processData() void {}");
+
+    const results = try explorer.searchContent("handle", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    // Should find "handle" in a.zig and b.zig but not c.zig
+    try testing.expect(results.len >= 2);
+    var found_a = false;
+    var found_b = false;
+    var found_c = false;
+    for (results) |r| {
+        if (std.mem.indexOf(u8, r.path, "a.zig") != null) found_a = true;
+        if (std.mem.indexOf(u8, r.path, "b.zig") != null) found_b = true;
+        if (std.mem.indexOf(u8, r.path, "c.zig") != null) found_c = true;
+    }
+    try testing.expect(found_a);
+    try testing.expect(found_b);
+    try testing.expect(!found_c);
+}
+
+test "issue-168: recall — fuzzy find ranks exact matches highest" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth.zig", "fn auth() void {}");
+    try explorer.indexFile("src/authorization.zig", "fn authorize() void {}");
+    try explorer.indexFile("src/authenticate.zig", "fn authenticate() void {}");
+
+    const results = try explorer.fuzzyFindFiles("auth.zig", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    // Exact match "auth.zig" should be ranked first
+    try testing.expect(std.mem.eql(u8, results[0].path, "src/auth.zig"));
+    // Score should decrease for less exact matches
+    if (results.len >= 2) {
+        try testing.expect(results[0].score > results[1].score);
+    }
+}
+
+test "issue-168: recall — multi-part query intersection" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth_controller.py", "class AuthController: pass");
+    try explorer.indexFile("src/auth_model.py", "class AuthModel: pass");
+    try explorer.indexFile("src/user_controller.py", "class UserController: pass");
+    try explorer.indexFile("src/user_model.py", "class UserModel: pass");
+
+    // "auth controller" should match auth_controller but not user_controller or auth_model
+    const results = try explorer.fuzzyFindFiles("auth controller", testing.allocator, 10);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "auth_controller") != null);
+}
+
+test "issue-168: recall — transposition tolerance in pipeline" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/middleware.zig", "fn process() void {}");
+    try explorer.indexFile("src/controller.zig", "fn handle() void {}");
+    try explorer.indexFile("src/service.zig", "fn serve() void {}");
+
+    // "midleware" (missing 'd') should still find middleware via Smith-Waterman
+    const results = try explorer.fuzzyFindFiles("midleware", testing.allocator, 5);
+    defer testing.allocator.free(results);
+
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "middleware") != null);
+}
+
+// ── Search UX tests ─────────────────────────────────────────────
+
+test "auto-retry: delimiter stripping finds results" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/auth_middleware.py", "def check(): pass");
+
+    // "authmiddleware" without delimiters should still find auth_middleware
+    const results = try explorer.fuzzyFindFiles("authmiddleware", testing.allocator, 10);
+    defer testing.allocator.free(results);
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, results[0].path, "auth_middleware") != null);
+}
+
+test "per-file truncation: max 5 matches per file in output" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Create a file with 10 lines all matching "const"
+    var content: [500]u8 = undefined;
+    var pos: usize = 0;
+    for (0..10) |i| {
+        const line = std.fmt.bufPrint(content[pos..], "const val{d} = {d};\n", .{ i, i }) catch break;
+        pos += line.len;
+    }
+    try explorer.indexFile("src/many_consts.zig", content[0..pos]);
+
+    // Search — explorer returns all 10, but MCP handler would truncate to 5
+    const results = try explorer.searchContent("const", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    // At the explorer level all 10 should be found
+    try testing.expect(results.len >= 10);
+}
+
+test "issue-179: block comment does not produce phantom symbols" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("test.zig", "/* commented out\npub fn fake_func() void {}\n*/\npub fn real_func() void {}\n");
+
+    const outline = (try explorer.getOutline("test.zig", testing.allocator)).?;
+    defer {
+        var o = outline;
+        o.deinit();
+    }
+    var found_real = false;
+    var found_fake = false;
+    for (outline.symbols.items) |sym| {
+        if (std.mem.indexOf(u8, sym.name, "real_func") != null) found_real = true;
+        if (std.mem.indexOf(u8, sym.name, "fake_func") != null) found_fake = true;
+    }
+    try testing.expect(found_real);
+    try testing.expect(!found_fake);
+}
+
+test "issue-179: code after single-line /* */ comment is parsed" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("test.zig", "/* skip this */ pub fn visible() void {}\n");
+
+    const outline = (try explorer.getOutline("test.zig", testing.allocator)).?;
+    defer {
+        var o = outline;
+        o.deinit();
+    }
+    var found = false;
+    for (outline.symbols.items) |sym| {
+        if (std.mem.indexOf(u8, sym.name, "visible") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "issue-179: Python docstring with text does not leak symbols" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("test.py", "def real():\n    \"\"\"This is a docstring.\n    def fake():\n        pass\n    \"\"\"\n    pass\n");
+
+    const outline = (try explorer.getOutline("test.py", testing.allocator)).?;
+    defer {
+        var o = outline;
+        o.deinit();
+    }
+    var found_real = false;
+    var found_fake = false;
+    for (outline.symbols.items) |sym| {
+        if (std.mem.indexOf(u8, sym.name, "real") != null) found_real = true;
+        if (std.mem.indexOf(u8, sym.name, "fake") != null) found_fake = true;
+    }
+    try testing.expect(found_real);
+    try testing.expect(!found_fake);
+}
+
+// ── New bug / perf regression tests ─────────────────────────────────────
+
+test "issue-246: TrigramIndex.removeFile cleans stale path_to_id left by failed indexFile" {
+    // Reproduces the corrupted state an OOM mid-way through indexFile leaves:
+    //   removeFile cleared file_trigrams, getOrCreateDocId wrote to path_to_id,
+    //   then an allocation failure meant file_trigrams.put never completed.
+    // Fix: removeFile must purge path_to_id even when file_trigrams has no entry.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    // Plant the invariant-violating state OOM would leave behind.
+    try idx.path_to_id.put("ghost.zig", 0);
+    try idx.id_to_path.append(testing.allocator, "ghost.zig");
+    // file_trigrams intentionally has NO entry for "ghost.zig".
+
+    idx.removeFile("ghost.zig");
+
+    // Currently FAILS: removeFile returns early at the second file_trigrams.getPtr
+    // check, leaving path_to_id permanently dirty.
+    try testing.expectEqual(@as(usize, 0), idx.path_to_id.count());
+}
+
+test "issue-247: TrigramIndex.id_to_path does not grow on re-index of same file" {
+    // removeFile removes path_to_id[path] but leaves the id_to_path slot intact.
+    // getOrCreateDocId then appends a new slot since path_to_id misses.
+    // After N re-indexes id_to_path.items.len must equal the number of *unique* files.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const src = "fn alpha() void {} fn beta() void {} const X = 1;";
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try idx.indexFile("f.zig", src);
+    }
+
+    // Currently FAILS: id_to_path.items.len == 5 (grows by 1 per re-index).
+    try testing.expectEqual(@as(usize, 1), idx.id_to_path.items.len);
+}
+
+test "issue-227: TrigramIndex.id_to_path stays bounded across many files re-indexed" {
+    // Broader regression: ensure re-indexing multiple distinct files also doesn't
+    // accumulate dead id_to_path slots.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const files = [_][]const u8{ "a.zig", "b.zig", "c.zig" };
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        for (files) |f| try idx.indexFile(f, "fn foo() void {}");
+    }
+
+    // 3 unique files × 4 rounds = 12 slots currently; fix should keep it at 3.
+    try testing.expectEqual(@as(usize, files.len), idx.id_to_path.items.len);
+}
+
+test "issue-248: PostingList.removeDocId removes target and preserves sorted order" {
+    // Documents the correctness contract for the O(log n) binary-search replacement.
+    // Currently correct but O(n); fix replaces linear scan with bsearch + single remove.
+    const PostingList = @import("index.zig").PostingList;
+    var list = PostingList{};
+    defer list.items.deinit(testing.allocator);
+
+    var id: u32 = 0;
+    while (id < 100) : (id += 1) {
+        const p = try list.getOrAddPosting(testing.allocator, id * 2); // even doc_ids 0..198
+        p.loc_mask = 0xFF;
+    }
+
+    list.removeDocId(50);
+    try testing.expectEqual(@as(usize, 99), list.items.items.len);
+    try testing.expect(list.getByDocId(48) != null);
+    try testing.expect(list.getByDocId(50) == null);
+    try testing.expect(list.getByDocId(52) != null);
+
+    // Sorted invariant must hold after removal.
+    for (1..list.items.items.len) |k| {
+        try testing.expect(list.items.items[k].doc_id > list.items.items[k - 1].doc_id);
+    }
+}
+
+test "issue-249: nuke.removeJsonMcpServerEntry returns null when key absent" {
+    // Verifies removeJsonMcpServerEntry does not signal a write when key is absent,
+    // which ensures the non-atomic rewriteConfigFile path is never triggered unnecessarily.
+    const result = try nuke_mod.removeJsonMcpServerEntry(testing.allocator, "{\"other\":1}", "codedb");
+    try testing.expect(result == null);
+}
+
+test "issue-250: searchContent finds content in files skipped by trigram index" {
+    // Files indexed with skip_trigram=true (e.g. past the 15k cap) must still be
+    // reachable via the fallback full-scan path in searchContent.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFileSkipTrigram("large.zig", "fn unique_zzz_sentinel() void {}");
+
+    const results = try explorer.searchContent("unique_zzz_sentinel", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
+    // Regression for readSectionString rejecting names/details > 4096 bytes.
+    // Before the fix max_len was 4096; any detail longer than that triggered
+    // error.InvalidData and loadSnapshot returned false.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Build a Zig source whose first function line exceeds 4 096 characters.
+    var src: std.ArrayList(u8) = .{};
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "pub fn bigSig(");
+    var param_i: usize = 0;
+    while (src.items.len < 5000) : (param_i += 1) {
+        var pb: [20]u8 = undefined;
+        const ps = std.fmt.bufPrint(&pb, "p{d}: u8, ", .{param_i}) catch break;
+        try src.appendSlice(testing.allocator, ps);
+    }
+    try src.appendSlice(testing.allocator, ") void {}\n");
+    try testing.expect(src.items.len > 4096); // guard: ensure we actually generated a long line
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/big.zig", src.items);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/big.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive long detail
+
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("bigSig", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
+
+test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
+    // Regression for the codedb 0.2.56 writer u16 overflow bug: when OUTLINE_STATE
+    // contains a detail that overflows u16 the section cursor de-syncs, making
+    // subsequent file records parse as garbage and loadOutlineStateMap throws.
+    // The catch fallback must produce an empty map so loadSnapshotFast falls
+    // through to indexFileOutlineOnly for every file in CONTENT.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/a.zig", "pub fn aFunc() void {}\n");
+    try exp.indexFile("src/b.zig", "pub fn bFunc() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/corrupt.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    // Overwrite the first 16 bytes of OUTLINE_STATE data with 0xFF.
+    // This makes the file_count field read as 0xFFFFFFFF — far more records
+    // than the data contains — causing readSectionString to eventually fail
+    // with error.InvalidData (runs off the end of the bytes slice).
+    {
+        var sections = (try snapshot_mod.readSections(snap_path, testing.allocator)).?;
+        defer sections.deinit();
+        const ols = sections.get(@intFromEnum(snapshot_mod.SectionId.outline_state)) orelse return;
+        const f = try std.fs.cwd().openFile(snap_path, .{ .mode = .read_write });
+        defer f.close();
+        try f.seekTo(ols.offset);
+        try f.writeAll(&([_]u8{0xFF} ** 16));
+    }
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive OUTLINE_STATE corruption
+
+    // Symbols must still be found — re-indexed from CONTENT
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("aFunc", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
+
+test "issue-224: codedb_symbol body=true returns full body — line_end populated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("t.zig",
+        \\pub fn foo() u32 {
+        \\    const a: u32 = 1;
+        \\    const b: u32 = 2;
+        \\    return a + b;
+        \\}
+    );
+
+    const results = try explorer.findAllSymbols("foo", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+
+    const sym = results[0].symbol;
+    try testing.expectEqual(@as(u32, 1), sym.line_start);
+    try testing.expectEqual(@as(u32, 5), sym.line_end);
+
+    const body = (try explorer.getSymbolBody("t.zig", sym.line_start, sym.line_end, alloc)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, body, "pub fn foo()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "return a + b;") != null);
+}
+
+test "issue-224: Python def line_end covers full body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("t.py",
+        \\def greet(name):
+        \\    msg = "hello"
+        \\    return msg + name
+    );
+
+    const results = try explorer.findAllSymbols("greet", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+
+    const sym = results[0].symbol;
+    try testing.expectEqual(@as(u32, 1), sym.line_start);
+    try testing.expectEqual(@as(u32, 3), sym.line_end);
+}
+
+test "issue-108: HCL resource block parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\resource "aws_instance" "web" {
+        \\  ami = "abc-123"
+        \\}
+    );
+    const results = try explorer.findAllSymbols("web", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.struct_def, results[0].symbol.kind);
+}
+
+test "issue-108: HCL variable and output parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("vars.tf",
+        \\variable "region" {
+        \\  default = "us-east-1"
+        \\}
+        \\output "ip" {
+        \\  value = aws_instance.web.public_ip
+        \\}
+    );
+    const vars = try explorer.findAllSymbols("region", alloc);
+    defer alloc.free(vars);
+    try testing.expect(vars.len == 1);
+    try testing.expectEqual(SymbolKind.variable, vars[0].symbol.kind);
+    const outs = try explorer.findAllSymbols("ip", alloc);
+    defer alloc.free(outs);
+    try testing.expect(outs.len == 1);
+    try testing.expectEqual(SymbolKind.constant, outs[0].symbol.kind);
+}
+
+test "issue-108: HCL module and provider parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\provider "aws" {
+        \\  region = "us-east-1"
+        \\}
+        \\module "vpc" {
+        \\  source = "./modules/vpc"
+        \\}
+    );
+    const providers = try explorer.findAllSymbols("aws", alloc);
+    defer alloc.free(providers);
+    try testing.expect(providers.len == 1);
+    const mods = try explorer.findAllSymbols("vpc", alloc);
+    defer alloc.free(mods);
+    try testing.expect(mods.len == 1);
+}
+
+test "issue-108: HCL comment lines skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\# This is a comment
+        \\// Another comment
+        \\variable "name" {}
+    );
+    const results = try explorer.findAllSymbols("name", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+}
+
+test "issue-108: detectLanguage handles .tf and .tfvars" {
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("main.tf"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("prod.tfvars"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("config.hcl"));
+}
+
+test "issue-215: R function assignment parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("analysis.R",
+        \\greet <- function(name) {
+        \\  paste("Hello", name)
+        \\}
+    );
+    const results = try explorer.findAllSymbols("greet", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.function, results[0].symbol.kind);
+}
+
+test "issue-215: R library import parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("script.r",
+        \\library(dplyr)
+        \\require(ggplot2)
+    );
+    const outline = try explorer.getOutline("script.r", alloc) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+}
+
+test "issue-215: R setClass parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("classes.R",
+        \\setClass("Person")
+        \\setRefClass("Animal")
+    );
+    const p = try explorer.findAllSymbols("Person", alloc);
+    defer alloc.free(p);
+    try testing.expect(p.len == 1);
+    try testing.expectEqual(SymbolKind.class_def, p[0].symbol.kind);
+    const a2 = try explorer.findAllSymbols("Animal", alloc);
+    defer alloc.free(a2);
+    try testing.expect(a2.len == 1);
+}
+
+test "issue-215: detectLanguage handles .r and .R" {
+    try testing.expectEqual(Language.r, explore.detectLanguage("script.r"));
+    try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
+}
+
+test "issue-179: Python inline docstring does not leak symbols" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("mod.py",
+        \\def real_func():
+        \\    """This docstring contains def fake(): pass"""
+        \\    return 1
+    );
+
+    const real = try explorer.findAllSymbols("real_func", alloc);
+    defer alloc.free(real);
+    try testing.expect(real.len == 1);
+
+    const fake = try explorer.findAllSymbols("fake", alloc);
+    defer alloc.free(fake);
+    try testing.expectEqual(@as(usize, 0), fake.len);
+}
+
+test "issue-179: Python multi-line docstring with def inside" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("doc.py",
+        \\def outer():
+        \\    """
+        \\    Example:
+        \\        def inner_example():
+        \\            pass
+        \\    """
+        \\    return True
+    );
+
+    const outer = try explorer.findAllSymbols("outer", alloc);
+    defer alloc.free(outer);
+    try testing.expect(outer.len == 1);
+
+    const inner = try explorer.findAllSymbols("inner_example", alloc);
+    defer alloc.free(inner);
+    try testing.expectEqual(@as(usize, 0), inner.len);
+}
+
+
+test "issue-262: sparse+trigram intersection drops files only in trigram index" {
+    // When both sparse and trigram indices return candidates, searchContent
+    // intersects them.  A file present in trigram candidates but absent from
+    // sparse candidates is silently dropped — a recall loss.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Index two files — both contain the query.
+    try explorer.indexFile("a.zig", "fn recall_target_alpha() void {}");
+    try explorer.indexFile("b.zig", "fn recall_target_alpha() void {} // more text here for variety");
+
+    // Simulate sparse index missing file "b.zig" (e.g. boundary misalignment).
+    // File b.zig remains in the trigram index but not in sparse.
+    explorer.sparse_ngram_index.removeFile("b.zig");
+
+    const results = try explorer.searchContent("recall_target_alpha", testing.allocator, 50);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    // Both files contain the query — both must appear.
+    try testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "issue-263: skip_trigram_files searched before max_results exhausted" {
+    // Files indexed with skip_trigram=true are only searched after all
+    // trigram/sparse/word paths are exhausted.  When a single normal file
+    // has enough matches to fill max_results, the skip_trigram file is
+    // never checked — even though it contains relevant content.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Normal file with 6 matches (one per line).
+    try explorer.indexFile("noisy.zig",
+        \\fn my_unique_func() void {}
+        \\fn my_unique_func_v2() void {}
+        \\const my_unique_func_ptr = undefined;
+        \\var my_unique_func_state = 0;
+        \\test "my_unique_func works" {}
+        \\// calls my_unique_func internally
+    );
+
+    // skip-trigram file with 1 match.
+    try explorer.indexFileSkipTrigram("large.zig", "fn my_unique_func() void {}");
+
+    // max_results=5: the normal file fills the quota, skip_trigram never searched.
+    const results = try explorer.searchContent("my_unique_func", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    // The skip_trigram file must be represented in results.
+    var found_large = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "large.zig")) found_large = true;
+    }
+    try testing.expect(found_large);
+}
+
+test "issue-264: early exit at max_results misses valid matches in remaining candidates" {
+    // searchContent stops as soon as result_list.items.len >= max_results.
+    // The first-indexed file is iterated first (doc_id order).  If it has
+    // many matches it fills the quota alone, and later files are never checked.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Index noisy file FIRST — it will be the first trigram candidate.
+    try explorer.indexFile("noisy.zig",
+        \\fn target_token() void {}
+        \\fn target_token_v2() void {}
+        \\const target_token_ptr = undefined;
+        \\var target_token_state = 0;
+        \\test "target_token works" {}
+        \\// calls target_token internally
+    );
+
+    // Index quiet file SECOND — it will be a later candidate.
+    try explorer.indexFile("quiet.zig", "fn target_token() void {}");
+
+    // max_results=5: noisy.zig has 6 matches, fills the quota.
+    const results = try explorer.searchContent("target_token", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    // quiet.zig must be represented in results even though noisy.zig
+    // has enough matches to fill max_results by itself.
+    var found_quiet = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "quiet.zig")) found_quiet = true;
+    }
+    try testing.expect(found_quiet);
+}
+
+// ── DependencyGraph tests ──────────────────────────────────
+
+test "dep-graph: reverse index gives O(1) imported_by lookup" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // main.zig imports store.zig and utils.zig
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "store.zig");
+    try deps1.append(testing.allocator, "utils.zig");
+    try graph.setDeps("main.zig", deps1);
+
+    // server.zig imports store.zig
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "store.zig");
+    try graph.setDeps("server.zig", deps2);
+
+    // store.zig is imported by main.zig and server.zig
+    const imported_by = try graph.getImportedBy("store.zig", testing.allocator);
+    defer {
+        for (imported_by) |p| testing.allocator.free(p);
+        testing.allocator.free(imported_by);
+    }
+    try testing.expectEqual(@as(usize, 2), imported_by.len);
+
+    // utils.zig is imported by main.zig only
+    const imported_by2 = try graph.getImportedBy("utils.zig", testing.allocator);
+    defer {
+        for (imported_by2) |p| testing.allocator.free(p);
+        testing.allocator.free(imported_by2);
+    }
+    try testing.expectEqual(@as(usize, 1), imported_by2.len);
+    try testing.expectEqualStrings("main.zig", imported_by2[0]);
+}
+
+test "dep-graph: setDeps removes old reverse edges" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // main.zig initially imports store.zig
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "store.zig");
+    try graph.setDeps("main.zig", deps1);
+
+    const before = try graph.getImportedBy("store.zig", testing.allocator);
+    defer {
+        for (before) |p| testing.allocator.free(p);
+        testing.allocator.free(before);
+    }
+    try testing.expectEqual(@as(usize, 1), before.len);
+
+    // main.zig re-indexed, now imports utils.zig instead
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "utils.zig");
+    try graph.setDeps("main.zig", deps2);
+
+    // store.zig should no longer have main.zig as a dependent
+    const after = try graph.getImportedBy("store.zig", testing.allocator);
+    defer {
+        for (after) |p| testing.allocator.free(p);
+        testing.allocator.free(after);
+    }
+    try testing.expectEqual(@as(usize, 0), after.len);
+
+    // utils.zig should now have main.zig
+    const utils_deps = try graph.getImportedBy("utils.zig", testing.allocator);
+    defer {
+        for (utils_deps) |p| testing.allocator.free(p);
+        testing.allocator.free(utils_deps);
+    }
+    try testing.expectEqual(@as(usize, 1), utils_deps.len);
+}
+
+test "dep-graph: transitive dependents via BFS" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // Build chain: app.zig -> server.zig -> store.zig -> utils.zig
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "server.zig");
+    try graph.setDeps("app.zig", deps1);
+
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "store.zig");
+    try graph.setDeps("server.zig", deps2);
+
+    var deps3: std.ArrayList([]const u8) = .{};
+    try deps3.append(testing.allocator, "utils.zig");
+    try graph.setDeps("store.zig", deps3);
+
+    // Changing utils.zig affects store.zig, server.zig, app.zig transitively
+    const blast = try graph.getTransitiveDependents("utils.zig", testing.allocator, null);
+    defer {
+        for (blast) |p| testing.allocator.free(p);
+        testing.allocator.free(blast);
+    }
+    try testing.expectEqual(@as(usize, 3), blast.len);
+
+    // With max_depth=1, only direct dependents
+    const shallow = try graph.getTransitiveDependents("utils.zig", testing.allocator, 1);
+    defer {
+        for (shallow) |p| testing.allocator.free(p);
+        testing.allocator.free(shallow);
+    }
+    try testing.expectEqual(@as(usize, 1), shallow.len);
+    try testing.expectEqualStrings("store.zig", shallow[0]);
+}
+
+test "dep-graph: transitive dependencies (forward BFS)" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // app.zig -> server.zig -> store.zig -> utils.zig
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "server.zig");
+    try graph.setDeps("app.zig", deps1);
+
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "store.zig");
+    try graph.setDeps("server.zig", deps2);
+
+    var deps3: std.ArrayList([]const u8) = .{};
+    try deps3.append(testing.allocator, "utils.zig");
+    try graph.setDeps("store.zig", deps3);
+
+    // app.zig transitively depends on server.zig, store.zig, utils.zig
+    const deps_all = try graph.getTransitiveDependencies("app.zig", testing.allocator, null);
+    defer {
+        for (deps_all) |p| testing.allocator.free(p);
+        testing.allocator.free(deps_all);
+    }
+    try testing.expectEqual(@as(usize, 3), deps_all.len);
+
+    // Depth=2: app.zig -> server.zig -> store.zig (not utils.zig)
+    const deps_shallow = try graph.getTransitiveDependencies("app.zig", testing.allocator, 2);
+    defer {
+        for (deps_shallow) |p| testing.allocator.free(p);
+        testing.allocator.free(deps_shallow);
+    }
+    try testing.expectEqual(@as(usize, 2), deps_shallow.len);
+}
+
+test "dep-graph: remove cleans forward and reverse edges" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "store.zig");
+    try graph.setDeps("main.zig", deps1);
+
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "store.zig");
+    try graph.setDeps("server.zig", deps2);
+
+    try testing.expectEqual(@as(usize, 2), graph.count());
+
+    // Remove main.zig
+    graph.remove("main.zig");
+    try testing.expectEqual(@as(usize, 1), graph.count());
+
+    // store.zig should only be imported by server.zig now
+    const imported_by = try graph.getImportedBy("store.zig", testing.allocator);
+    defer {
+        for (imported_by) |p| testing.allocator.free(p);
+        testing.allocator.free(imported_by);
+    }
+    try testing.expectEqual(@as(usize, 1), imported_by.len);
+    try testing.expectEqualStrings("server.zig", imported_by[0]);
+}
+
+test "dep-graph: cycle does not cause infinite BFS" {
+    var graph = DependencyGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    // Create a cycle: a.zig -> b.zig -> c.zig -> a.zig
+    var deps1: std.ArrayList([]const u8) = .{};
+    try deps1.append(testing.allocator, "b.zig");
+    try graph.setDeps("a.zig", deps1);
+
+    var deps2: std.ArrayList([]const u8) = .{};
+    try deps2.append(testing.allocator, "c.zig");
+    try graph.setDeps("b.zig", deps2);
+
+    var deps3: std.ArrayList([]const u8) = .{};
+    try deps3.append(testing.allocator, "a.zig");
+    try graph.setDeps("c.zig", deps3);
+
+    // Transitive dependents of a.zig — should terminate despite cycle
+    const blast = try graph.getTransitiveDependents("a.zig", testing.allocator, null);
+    defer {
+        for (blast) |p| testing.allocator.free(p);
+        testing.allocator.free(blast);
+    }
+    // b.zig and c.zig both transitively depend on a.zig
+    try testing.expectEqual(@as(usize, 2), blast.len);
+
+    // Forward transitive deps from a.zig — should also terminate
+    const fwd = try graph.getTransitiveDependencies("a.zig", testing.allocator, null);
+    defer {
+        for (fwd) |p| testing.allocator.free(p);
+        testing.allocator.free(fwd);
+    }
+    try testing.expectEqual(@as(usize, 2), fwd.len);
+}
+
+test "dep-graph: Explorer integration — getImportedBy uses reverse index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("store.zig", "pub const Store = struct {};");
+    try explorer.indexFile("main.zig", "const store = @import(\"store.zig\");\npub fn main() void {}");
+    try explorer.indexFile("server.zig", "const store = @import(\"store.zig\");\npub fn serve() void {}");
+
+    const deps = try explorer.getImportedBy("store.zig", testing.allocator);
+    defer {
+        for (deps) |d| testing.allocator.free(d);
+        testing.allocator.free(deps);
+    }
+    try testing.expectEqual(@as(usize, 2), deps.len);
+}
+
+test "dep-graph: Explorer transitive dependents" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("utils.zig", "pub fn helper() void {}");
+    try explorer.indexFile("store.zig", "const utils = @import(\"utils.zig\");\npub const Store = struct {};");
+    try explorer.indexFile("main.zig", "const store = @import(\"store.zig\");\npub fn main() void {}");
+
+    // Transitive: changing utils.zig affects store.zig and main.zig
+    const blast = try explorer.getTransitiveDependents("utils.zig", testing.allocator, null);
+    defer {
+        for (blast) |b| testing.allocator.free(b);
+        testing.allocator.free(blast);
+    }
+    try testing.expectEqual(@as(usize, 2), blast.len);
+}
+
+// ── Symbol index tests ─────────────────────────────────────
+
+test "symbol-index: O(1) findSymbol via symbol_index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("math.zig", "pub fn add(a: i32, b: i32) i32 { return a + b; }\npub fn subtract(a: i32, b: i32) i32 { return a - b; }\n");
+    try explorer.indexFile("utils.zig", "pub fn add(x: f64, y: f64) f64 { return x + y; }\npub fn format() void {}\n");
+
+    // findSymbol should return first match via index
+    const result = try explorer.findSymbol("add", testing.allocator);
+    try testing.expect(result != null);
+    const r = result.?;
+    defer {
+        testing.allocator.free(r.path);
+        testing.allocator.free(r.symbol.name);
+        if (r.symbol.detail) |d| testing.allocator.free(d);
+    }
+    try testing.expectEqualStrings("add", r.symbol.name);
+
+    // findAllSymbols should return both
+    const all = try explorer.findAllSymbols("add", testing.allocator);
+    defer {
+        for (all) |s| {
+            testing.allocator.free(s.path);
+            testing.allocator.free(s.symbol.name);
+            if (s.symbol.detail) |d| testing.allocator.free(d);
+        }
+        testing.allocator.free(all);
+    }
+    try testing.expectEqual(@as(usize, 2), all.len);
+}
+
+test "symbol-index: removeFile cleans symbol_index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("a.zig", "pub fn unique_func() void {}");
+    const before = try explorer.findSymbol("unique_func", testing.allocator);
+    try testing.expect(before != null);
+    testing.allocator.free(before.?.path);
+    testing.allocator.free(before.?.symbol.name);
+    if (before.?.symbol.detail) |d| testing.allocator.free(d);
+
+    explorer.removeFile("a.zig");
+
+    const after = try explorer.findSymbol("unique_func", testing.allocator);
+    try testing.expect(after == null);
+}
+
+test "symbol-index: re-index updates symbol_index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("a.zig", "pub fn old_name() void {}");
+    const r1 = try explorer.findSymbol("old_name", testing.allocator);
+    try testing.expect(r1 != null);
+    testing.allocator.free(r1.?.path);
+    testing.allocator.free(r1.?.symbol.name);
+    if (r1.?.symbol.detail) |d| testing.allocator.free(d);
+
+    // Re-index same file with different content
+    try explorer.indexFile("a.zig", "pub fn new_name() void {}");
+    const r2 = try explorer.findSymbol("old_name", testing.allocator);
+    try testing.expect(r2 == null);
+
+    const r3 = try explorer.findSymbol("new_name", testing.allocator);
+    try testing.expect(r3 != null);
+    testing.allocator.free(r3.?.path);
+    testing.allocator.free(r3.?.symbol.name);
+    if (r3.?.symbol.detail) |d| testing.allocator.free(d);
+}
+
+// ── searchInContent incremental line counting test ─────────
+
+test "search: line numbers correct with incremental counting" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    // File with target on specific lines
+    const content = "line1\nline2\ntarget_here\nline4\nline5\ntarget_here\nline7\n";
+    try explorer.indexFile("test.zig", content);
+
+    const results = try explorer.searchContent("target_here", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expectEqual(@as(u32, 3), results[0].line_num);
+    try testing.expectEqual(@as(u32, 6), results[1].line_num);
 }

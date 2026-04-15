@@ -137,6 +137,7 @@ const html =
     \\      <a href="/benchmarks">Benchmarks</a>
     \\      <a href="/improvements">Improvements</a>
     \\      <a href="/quickstart">Install</a>
+    \\      <a href="/v0.2.57" style="color:var(--accent-light);">v0.2.57</a>
     \\      <a href="/privacy">Privacy</a>
     \\      <a href="https://github.com/justrach/codedb">GitHub</a>
     \\      <a href="/quickstart" class="nav-cta">Get started</a>
