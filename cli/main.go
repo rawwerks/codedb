@@ -141,7 +141,11 @@ func main() {
 		requireArgs(cmdArgs, 1, "read <path> [start] [end]")
 		root = resolveRoot(root)
 		ensureDaemon(cfg, root, cfg.DaemonPort)
-		resp := query(cfg.DaemonPort, "/file/read?path="+url.QueryEscape(cmdArgs[0]))
+		// Workaround: upstream /file/read does not percentDecode the path query param
+		// (other endpoints like /explore/outline do). Preserve raw / so the daemon
+		// can find the file. See codedb v0.2.58181 server.zig handler for /file/read.
+		readPath := strings.ReplaceAll(url.QueryEscape(cmdArgs[0]), "%2F", "/")
+		resp := query(cfg.DaemonPort, "/file/read?path="+readPath)
 		content := jsonStr(resp, "content")
 		if len(cmdArgs) >= 2 {
 			lines := strings.Split(content, "\n")
@@ -454,7 +458,8 @@ func ensureDaemon(cfg *Config, root string, port int) {
 	}
 	binary := cfg.Binary
 	fmt.Fprintf(os.Stderr, "starting codedb %s on :%d ...\n", root, port)
-	cmd := exec.Command(binary, root, "--port", strconv.Itoa(port), "serve")
+	cmd := exec.Command(binary, root, "serve")
+	cmd.Env = append(os.Environ(), "CODEDB_PORT="+strconv.Itoa(port))
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Start()
@@ -630,8 +635,8 @@ type Config struct {
 func defaultConfig() *Config {
 	return &Config{
 		Binary:     "codedb",
-		DaemonPort: 7719,
-		PortStart:  7720,
+		DaemonPort: 6767,
+		PortStart:  6768,
 		Roots:      []string{},
 	}
 }
@@ -677,10 +682,10 @@ func writeDefaultConfig(path string) {
 binary = "codedb"
 
 # Default port for single-root daemon
-daemon_port = 7719
+daemon_port = 6767
 
 # Starting port for machine-wide daemons (one per root, incrementing)
-port_start = 7720
+port_start = 6768
 
 # Machine-wide roots — each gets its own daemon for microsecond search
 # Edit these to match your machine layout
